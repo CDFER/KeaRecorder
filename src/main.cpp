@@ -37,65 +37,130 @@ USBCDC USBSerial;
 #include <TFT_eSPI.h>
 TFT_eSPI tft = TFT_eSPI();
 
+RTC_DATA_ATTR int bootCount = 0;
+
+void print_wakeup_reason() {
+	esp_sleep_wakeup_cause_t wakeup_reason;
+
+	wakeup_reason = esp_sleep_get_wakeup_cause();
+
+	int GPIO_reason = esp_sleep_get_ext1_wakeup_status();
+
+	switch (wakeup_reason) {
+		case ESP_SLEEP_WAKEUP_EXT0:
+			tft.println("ULP_GPIO");
+			break;
+		case ESP_SLEEP_WAKEUP_EXT1:
+			tft.println("ULP_GPIO_MASK");
+			tft.print("GPIO ");
+			tft.println((log(GPIO_reason)) / log(2), 0);
+			break;
+		case ESP_SLEEP_WAKEUP_TIMER:
+			tft.println("ULP timer");
+			break;
+		case ESP_SLEEP_WAKEUP_TOUCHPAD:
+			tft.println("ULP touchpad");
+			break;
+		case ESP_SLEEP_WAKEUP_ULP:
+			tft.println("ULP program");
+			break;
+		default:
+			tft.printf("Wakeup ???:%d\n", wakeup_reason);
+			break;
+	}
+}
+
+void IRAM_ATTR ISR() {
+	while (digitalRead(12) == 1)
+	{
+		vTaskDelay(1);
+	}
+	
+	// delay(1000);
+	digitalWrite(38, LOW);
+	// delay(1000);
+	// digitalWrite(38, HIGH);	 // 3V3_SPI_EN
+	//esp_sleep_enable_ext0_wakeup(GPIO_NUM_12, 1);  // 1 = High, 0 = Low
+#define BUTTON_PIN_BITMASK 0x000001000	// 2^12 in hex
+	esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
+	esp_deep_sleep_start();
+}
+
 void setup() {
 	USBSerial.begin(115200);
-	// while (!USBSerial)
-	// 	;
 	USBSerial.setDebugOutput(true);
 
-	USBSerial.println("DallasTemp0.1.0");
+	USBSerial.println("Kea Recorder 0.1.0");
 
-	// digitalWrite(TFT_CS, HIGH); // TFT screen chip select
-	// digitalWrite(5, HIGH); // SD card chips select, must use GPIO 5 (ESP32 SS)
+	// Increment boot number and print it every reboot
+	++bootCount;
+	//Serial.println("Boot number: " + String(bootCount));
+
+	// Print the wakeup reason for ESP32
+	//print_wakeup_reason();
+
+	//esp_sleep_enable_ext0_wakeup(GPIO_NUM_12, 1);  // 1 = High, 0 = Low
+
 
 	pinMode(38, OUTPUT);
-	digitalWrite(38, LOW);	 // 3V3_SPI_EN
+	digitalWrite(38, HIGH);	 // 3V3_SPI_EN
 
-	delay(500);
+	// delay(500);
 
-	if (!SD.begin()) {
-		USBSerial.println("Card Mount Failed");
-		return;
-	}
-	uint8_t cardType = SD.cardType();
+	// if (!SD.begin()) {
+	// 	USBSerial.println("Card Mount Failed");
+	// 	return;
+	// }
+	// uint8_t cardType = SD.cardType();
 
-	if (cardType == CARD_NONE) {
-		USBSerial.println("No SD card attached");
-		return;
-	}
+	// if (cardType == CARD_NONE) {
+	// 	USBSerial.println("No SD card attached");
+	// 	return;
+	// }
 
-	USBSerial.print("SD Card Type: ");
-	if (cardType == CARD_MMC) {
-		USBSerial.println("MMC");
-	} else if (cardType == CARD_SD) {
-		USBSerial.println("SDSC");
-	} else if (cardType == CARD_SDHC) {
-		USBSerial.println("SDHC");
-	} else {
-		USBSerial.println("UNKNOWN");
-	}
+	// USBSerial.print("SD Card Type: ");
+	// if (cardType == CARD_MMC) {
+	// 	USBSerial.println("MMC");
+	// } else if (cardType == CARD_SD) {
+	// 	USBSerial.println("SDSC");
+	// } else if (cardType == CARD_SDHC) {
+	// 	USBSerial.println("SDHC");
+	// } else {
+	// 	USBSerial.println("UNKNOWN");
+	// }
 
-	uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-	Serial.printf("SD Card Size: %lluMB\n", cardSize);
+	// uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+	// Serial.printf("SD Card Size: %lluMB\n", cardSize);
 
-	PCF8563_Class rtc;
-	const char* time_zone = "NZST-12NZDT,M9.5.0,M4.1.0/3";	// Time zone (see https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv)
+	// PCF8563_Class rtc;
+	// const char* time_zone = "NZST-12NZDT,M9.5.0,M4.1.0/3";	// Time zone (see https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv)
 
-	Wire.begin(WIRE_SDA_PIN, WIRE_SCL_PIN, 100000);
+	// Wire.begin(WIRE_SDA_PIN, WIRE_SCL_PIN, 100000);
 
-	rtc.begin(Wire);
+	// rtc.begin(Wire);
 
-	if (rtc.syncToSystem() == true) {
-		setenv("TZ", time_zone, 1);
-		tzset();
-	}
-
-	// pinMode(13,OUTPUT);
-	// analogWrite(13,1);
+	// if (rtc.syncToSystem() == true) {
+	// 	setenv("TZ", time_zone, 1);
+	// 	tzset();
+	// }
 
 	tft.begin();
-	tft.setRotation(2);
-	tft.fillScreen(TFT_GREEN);
+	tft.setRotation(1);
+	tft.fillScreen(TFT_BLACK);
+	tft.setTextColor(TFT_WHITE);
+	tft.setTextFont(4);
+	tft.println("   Kea Recorder ");
+	tft.println("Reboot: " + String(bootCount));
+	print_wakeup_reason();
+
+	pinMode(13, OUTPUT);
+	analogWrite(13, 128);
+
+	analogSetPinAttenuation(1, ADC_0db);  // 0db (0 mV ~ 750 mV)
+	delay(300);
+	tft.println("Battery: " + String(analogReadMilliVolts(1) * 11) + "mV");
+
+
 
 	// sensors.begin();
 
@@ -135,9 +200,12 @@ void setup() {
 	// 		Serial.print(" but could not detect address. Check power and cabling");
 	// 	}
 	// }
+	pinMode(12, INPUT);
+	attachInterrupt(12, ISR, HIGH);
 }
 
 void loop() {
+
 	// // call sensors.requestTemperatures() to issue a global temperature
 	// // request to all devices on the bus
 	// sensors.requestTemperatures(); // Send the command to get temperatures
@@ -152,21 +220,13 @@ void loop() {
 	// //  or stay on the line is there is room for the text with tft.print)
 	// tft.setCursor(0, 5, 6);
 
-	// Set the font colour to be green with black background, set to font 2
-	tft.setTextColor(TFT_BLACK, TFT_BLACK);
-	tft.setTextFont(4);
-	// tft.println(buf);
-	tft.println("USB Upload :)");
+	// // Set the font colour to be green with black background, set to font 2
+	// tft.setTextColor(TFT_BLACK, TFT_BLACK);
+	// tft.setTextFont(4);
+	// // tft.println(buf);
+	// tft.println("Test...");
 
-	// vTaskDelay(100);
+	vTaskDelay(100);
 
-	delay(1000);
-
-	char string[16];
-	uint32_t f;
-
-	f = getCpuFrequencyMhz();
-	sprintf(string, "CPU Freq: %i", f);
-	Serial.println(string);
-	// Serial.println("YYY");
+	// delay(1000);
 }
