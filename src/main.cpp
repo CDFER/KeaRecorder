@@ -3,39 +3,18 @@
 // #include <SPI.h>
 #include "USB.h"
 USBCDC USBSerial;
-// #include <FS.h>
+
 #include <SD.h>
+
+#include <tft_eSPI.h>
+TFT_eSPI screen = TFT_eSPI();
 
 #include "pcf8563.h"  // pcf8563 (Backup Clock)
 
-#define WIRE_SDA_PIN 8
-#define WIRE_SCL_PIN 9
+#define DEEPSLEEP_INTERUPT_BITMASK pow(2, WAKE_BUTTON) + pow(2, UP_BUTTON) + pow(2, DOWN_BUTTON)
 
-// #include <OneWire.h>
-// #include <DallasTemperature.h>
 
-// // Data wire is plugged into port 2 on the Arduino
-// #define ONE_WIRE_BUS 27
-// #define TEMPERATURE_PRECISION 11
 
-// // Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
-// OneWire oneWire(ONE_WIRE_BUS);
-
-// // Pass our oneWire reference to Dallas Temperature.
-// DallasTemperature sensors(&oneWire);
-
-// arrays to hold device addresses
-// DeviceAddress insideThermometer, outsideThermometer;
-
-// Assign address manually. The addresses below will need to be changed
-// to valid device addresses on your bus. Device address can be retrieved
-// by using either oneWire.search(deviceAddress) or individually via
-// sensors.getAddress(deviceAddress, index)
-// DeviceAddress insideThermometer = { 0x28, 0x1D, 0x39, 0x31, 0x2, 0x0, 0x0, 0xF0 };
-// DeviceAddress outsideThermometer   = { 0x28, 0x3F, 0x1C, 0x31, 0x2, 0x0, 0x0, 0x2 };
-
-#include <TFT_eSPI.h>
-TFT_eSPI tft = TFT_eSPI();
 
 RTC_DATA_ATTR int bootCount = 0;
 
@@ -44,28 +23,27 @@ void print_wakeup_reason() {
 
 	wakeup_reason = esp_sleep_get_wakeup_cause();
 
-	int GPIO_reason = esp_sleep_get_ext1_wakeup_status();
+	int wakeup_pin = esp_sleep_get_ext1_wakeup_status();
 
 	switch (wakeup_reason) {
 		case ESP_SLEEP_WAKEUP_EXT0:
-			tft.println("ULP_GPIO");
+			screen.println("ULP_GPIO");
 			break;
 		case ESP_SLEEP_WAKEUP_EXT1:
-			tft.println("ULP_GPIO_MASK");
-			tft.print("GPIO ");
-			tft.println((log(GPIO_reason)) / log(2), 0);
+			screen.print("ULP_GPIO_");
+			screen.println((log(wakeup_pin)) / log(2), 0);
 			break;
 		case ESP_SLEEP_WAKEUP_TIMER:
-			tft.println("ULP timer");
+			screen.println("ULP timer");
 			break;
 		case ESP_SLEEP_WAKEUP_TOUCHPAD:
-			tft.println("ULP touchpad");
+			screen.println("ULP touchpad");
 			break;
 		case ESP_SLEEP_WAKEUP_ULP:
-			tft.println("ULP program");
+			screen.println("ULP program");
 			break;
 		default:
-			tft.printf("Wakeup ???:%d\n", wakeup_reason);
+			screen.println("External Reset");
 			break;
 	}
 }
@@ -76,13 +54,10 @@ void IRAM_ATTR ISR() {
 		vTaskDelay(1);
 	}
 	
-	// delay(1000);
-	digitalWrite(38, LOW);
-	// delay(1000);
-	// digitalWrite(38, HIGH);	 // 3V3_SPI_EN
-	//esp_sleep_enable_ext0_wakeup(GPIO_NUM_12, 1);  // 1 = High, 0 = Low
-#define BUTTON_PIN_BITMASK 0x000001000	// 2^12 in hex
-	esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
+	digitalWrite(SPI_EN, LOW);
+
+	esp_sleep_enable_ext1_wakeup(DEEPSLEEP_INTERUPT_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
+	esp_sleep_enable_timer_wakeup(5 * 1000000ULL);
 	esp_deep_sleep_start();
 }
 
@@ -92,75 +67,54 @@ void setup() {
 
 	USBSerial.println("Kea Recorder 0.1.0");
 
-	// Increment boot number and print it every reboot
 	++bootCount;
-	//Serial.println("Boot number: " + String(bootCount));
-
-	// Print the wakeup reason for ESP32
-	//print_wakeup_reason();
-
-	//esp_sleep_enable_ext0_wakeup(GPIO_NUM_12, 1);  // 1 = High, 0 = Low
 
 
-	pinMode(38, OUTPUT);
-	digitalWrite(38, HIGH);	 // 3V3_SPI_EN
+	pinMode(SPI_EN, OUTPUT);
+	digitalWrite(SPI_EN, HIGH);	 // 3V3_SPI_EN
 
-	// delay(500);
+	screen.begin();
+	screen.setRotation(1);
+	screen.fillScreen(TFT_BLACK);
+	screen.setTextColor(TFT_WHITE);
+	screen.setTextFont(4);
+	screen.println("   Kea Recorder ");
+	screen.println("Reboot: " + String(bootCount));
+	print_wakeup_reason();
 
+	pinMode(BACKLIGHT, OUTPUT);
+	analogWrite(BACKLIGHT, 64);
+
+	analogSetPinAttenuation(VBAT_SENSE, ADC_0db);  // 0db (0 mV ~ 750 mV)
+	delay(300);
+	screen.println("Battery: " + String(analogReadMilliVolts(VBAT_SENSE) * VBAT_SENSE_SCALE) + "mV");
+
+	// digitalWrite(screen_CS,LOW);
+	// delay(300);
 	// if (!SD.begin()) {
-	// 	USBSerial.println("Card Mount Failed");
+	// 	screen.println("Card Mount Failed");
 	// 	return;
 	// }
 	// uint8_t cardType = SD.cardType();
 
 	// if (cardType == CARD_NONE) {
-	// 	USBSerial.println("No SD card attached");
+	// 	screen.println("No SD card attached");
 	// 	return;
 	// }
 
-	// USBSerial.print("SD Card Type: ");
+	// screen.print("SD Card Type: ");
 	// if (cardType == CARD_MMC) {
-	// 	USBSerial.println("MMC");
+	// 	screen.println("MMC");
 	// } else if (cardType == CARD_SD) {
-	// 	USBSerial.println("SDSC");
+	// 	screen.println("SDSC");
 	// } else if (cardType == CARD_SDHC) {
-	// 	USBSerial.println("SDHC");
+	// 	screen.println("SDHC");
 	// } else {
-	// 	USBSerial.println("UNKNOWN");
+	// 	screen.println("UNKNOWN");
 	// }
 
 	// uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-	// Serial.printf("SD Card Size: %lluMB\n", cardSize);
-
-	// PCF8563_Class rtc;
-	// const char* time_zone = "NZST-12NZDT,M9.5.0,M4.1.0/3";	// Time zone (see https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv)
-
-	// Wire.begin(WIRE_SDA_PIN, WIRE_SCL_PIN, 100000);
-
-	// rtc.begin(Wire);
-
-	// if (rtc.syncToSystem() == true) {
-	// 	setenv("TZ", time_zone, 1);
-	// 	tzset();
-	// }
-
-	tft.begin();
-	tft.setRotation(1);
-	tft.fillScreen(TFT_BLACK);
-	tft.setTextColor(TFT_WHITE);
-	tft.setTextFont(4);
-	tft.println("   Kea Recorder ");
-	tft.println("Reboot: " + String(bootCount));
-	print_wakeup_reason();
-
-	pinMode(13, OUTPUT);
-	analogWrite(13, 128);
-
-	analogSetPinAttenuation(1, ADC_0db);  // 0db (0 mV ~ 750 mV)
-	delay(300);
-	tft.println("Battery: " + String(analogReadMilliVolts(1) * 11) + "mV");
-
-
+	// screen.printf("%lluMB\n", cardSize);
 
 	// sensors.begin();
 
@@ -216,15 +170,15 @@ void loop() {
 	// //Serial.println(millis());
 
 	// // Set "cursor" at top left corner of display (0,0) and select font (must include in platformio.ini)
-	// // (cursor will move to next line automatically during printing with 'tft.println'
-	// //  or stay on the line is there is room for the text with tft.print)
-	// tft.setCursor(0, 5, 6);
+	// // (cursor will move to next line automatically during printing with 'screen.println'
+	// //  or stay on the line is there is room for the text with screen.print)
+	// screen.setCursor(0, 5, 6);
 
 	// // Set the font colour to be green with black background, set to font 2
-	// tft.setTextColor(TFT_BLACK, TFT_BLACK);
-	// tft.setTextFont(4);
-	// // tft.println(buf);
-	// tft.println("Test...");
+	// screen.setTextColor(screen_BLACK, screen_BLACK);
+	// screen.setTextFont(4);
+	// // screen.println(buf);
+	// screen.println("Test...");
 
 	vTaskDelay(100);
 

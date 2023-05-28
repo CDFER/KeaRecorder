@@ -5,7 +5,37 @@
         },
         "core": "esp32",
         "extra_flags": [
-            "-DARDUINO_USB_CDC_ON_BOOT=1"
+            "-DARDUINO_USB_CDC_ON_BOOT=1",
+            "-DUSER_SETUP_LOADED=1",
+            "-DST7789_DRIVER=1",
+            "-DTFT_WIDTH=172",
+            "-DTFT_HEIGHT=320",
+            "-DTFT_MOSI=35",
+            "-DTFT_SCLK=36",
+            "-DTFT_CS=21",
+            "-DTFT_DC=14",
+            "-DTFT_RST=33",
+            "-DBACKLIGHT=13",
+            "-DVBAT_SENSE=1",
+            "-DVBAT_SENSE_SCALE=11",
+            "-DOUTPUT_EN=2",
+            "-DSPI_EN=38",
+            "-DSD_CARD_CS=34",
+            "-DWAKE_BUTTON=12",
+            "-DDOWN_BUTTON=11",
+            "-DUP_BUTTON=10",
+            "-DWIRE_SCL=9",
+            "-DWIRE_SDA=8",
+            "-DWIRE_RTC_INT=3",
+            "-DUART_RX=17",
+            "-DJST_UART_TX=16",
+            "-DJST_UART_RX=17",
+            "-DJST_IO_1_1=4",
+            "-DJST_IO_1_2=5",
+            "-DJST_IO_2_1=6",
+            "-DJST_IO_2_2=7",
+            "-DJST_IO_3_1=4",
+            "-DJST_IO_3_2=4"
         ],
         "f_cpu": "40000000L",
         "f_flash": "40000000L",
@@ -28,7 +58,7 @@
         "variant": "esp32s2"
     },
     "connectivity": [
-        "wifi"
+        "wifi"  
     ],
     "debug": {
         "openocd_target": "esp32s2.cfg"
