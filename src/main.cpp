@@ -5,18 +5,41 @@
 USBCDC USBSerial;
 
 #include <SD.h>
-
 #include <tft_eSPI.h>
 TFT_eSPI screen = TFT_eSPI();
 
+#include <WiFi.h>
+
+#include "time.h"
+const char* ssid = "";
+const char* password = "";
+
 #include "pcf8563.h"  // pcf8563 (Backup Clock)
+#include "sntp.h"
+PCF8563_Class rtc;
+const char* time_zone = "NZST-12NZDT,M9.5.0,M4.1.0/3";	// Time zone (see https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv)
+const char* time_format = "%d/%m/%y,%H:%M:%S";
+
+#include <DallasTemperature.h>
+#include <OneWire.h>
+#define ONE_WIRE_BUS JST_IO_1_1
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature dallasSensors(&oneWire);
 
 #define DEEPSLEEP_INTERUPT_BITMASK pow(2, WAKE_BUTTON) + pow(2, UP_BUTTON) + pow(2, DOWN_BUTTON)
 
-
-
-
 RTC_DATA_ATTR int bootCount = 0;
+RTC_DATA_ATTR int batteryMilliVolts = 0;
+RTC_DATA_ATTR bool recording = false;
+RTC_DATA_ATTR int recordingIntervalSeconds = 10;
+RTC_DATA_ATTR int errorCounter = 0;
+
+RTC_DATA_ATTR struct TempSensors {
+	uint8_t ID;
+	int nameAddr;  // pointer to descriptive name in EEPROM
+	int DSAddr;	   // pointer to address of the DS18B20
+	uint8_t pin;   // pin the DS18B20 was connected to
+} TS[20];
 
 void print_wakeup_reason() {
 	esp_sleep_wakeup_cause_t wakeup_reason;
@@ -48,139 +71,126 @@ void print_wakeup_reason() {
 	}
 }
 
-void IRAM_ATTR ISR() {
-	while (digitalRead(12) == 1)
-	{
-		vTaskDelay(1);
-	}
-	
-	digitalWrite(SPI_EN, LOW);
+void syncClock() {
+	// Define the NTP servers to be used for time synchronization
+	const char* ntpServer1 = "pool.ntp.org";
+	const char* ntpServer2 = "time.nist.gov";
+	const char* ntpServer3 = "time.google.com";
 
-	esp_sleep_enable_ext1_wakeup(DEEPSLEEP_INTERUPT_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
-	esp_sleep_enable_timer_wakeup(5 * 1000000ULL);
-	esp_deep_sleep_start();
+	// Set the SNTP operating mode to polling, and configure the NTP servers
+	sntp_setoperatingmode(SNTP_OPMODE_POLL);
+	sntp_setservername(0, ntpServer1);
+	sntp_setservername(1, ntpServer2);
+	sntp_setservername(2, ntpServer3);
+	sntp_init();
+
+	WiFi.begin(ssid, password);
+
+	do {
+		delay(10);
+	} while (!(sntp_getreachability(0) + sntp_getreachability(1) + sntp_getreachability(2) > 0));
+
+	rtc.syncToRtc();
+	WiFi.disconnect();
+	screen.println("sync to RTC");
 }
 
 void setup() {
-	USBSerial.begin(115200);
-	USBSerial.setDebugOutput(true);
-
-	USBSerial.println("Kea Recorder 0.1.0");
-
 	++bootCount;
 
+	float tempC;
+	char timeStamp[32];
+	char buf[32];
+	File file;
 
-	pinMode(SPI_EN, OUTPUT);
-	digitalWrite(SPI_EN, HIGH);	 // 3V3_SPI_EN
+	esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
 
-	screen.begin();
-	screen.setRotation(1);
-	screen.fillScreen(TFT_BLACK);
-	screen.setTextColor(TFT_WHITE);
-	screen.setTextFont(4);
-	screen.println("   Kea Recorder ");
-	screen.println("Reboot: " + String(bootCount));
-	print_wakeup_reason();
+	switch (wakeup_reason) {
+		case ESP_SLEEP_WAKEUP_EXT0:
+		case ESP_SLEEP_WAKEUP_EXT1:
+			pinMode(SPI_EN, OUTPUT);
+			digitalWrite(SPI_EN, HIGH);	 // 3V3_SPI_EN
 
-	pinMode(BACKLIGHT, OUTPUT);
-	analogWrite(BACKLIGHT, 64);
+			screen.begin();
+			screen.setRotation(3);
+			screen.fillScreen(TFT_BLACK);
+			// screen.setTextColor(TFT_WHITE);
+			screen.setTextFont(4);
+			screen.println("Reboot: " + String(bootCount));
+			// print_wakeup_reason();
 
-	analogSetPinAttenuation(VBAT_SENSE, ADC_0db);  // 0db (0 mV ~ 750 mV)
-	delay(300);
-	screen.println("Battery: " + String(analogReadMilliVolts(VBAT_SENSE) * VBAT_SENSE_SCALE) + "mV");
+			pinMode(BACKLIGHT, OUTPUT);
+			analogWrite(BACKLIGHT, 256);
 
-	// digitalWrite(screen_CS,LOW);
-	// delay(300);
-	// if (!SD.begin()) {
-	// 	screen.println("Card Mount Failed");
-	// 	return;
-	// }
-	// uint8_t cardType = SD.cardType();
+			analogSetPinAttenuation(VBAT_SENSE, ADC_0db);  // 0db (0 mV ~ 750 mV)
+			delay(300);
+			screen.println("Battery: " + String(analogReadMilliVolts(VBAT_SENSE) * VBAT_SENSE_SCALE) + "mV");
+			delay(5000);
+			break;
+		case ESP_SLEEP_WAKEUP_TIMER:
+			Wire.begin(WIRE_SDA, WIRE_SCL, 100000);
 
-	// if (cardType == CARD_NONE) {
-	// 	screen.println("No SD card attached");
-	// 	return;
-	// }
+			rtc.begin(Wire);
 
-	// screen.print("SD Card Type: ");
-	// if (cardType == CARD_MMC) {
-	// 	screen.println("MMC");
-	// } else if (cardType == CARD_SD) {
-	// 	screen.println("SDSC");
-	// } else if (cardType == CARD_SDHC) {
-	// 	screen.println("SDHC");
-	// } else {
-	// 	screen.println("UNKNOWN");
-	// }
+			if (rtc.syncToSystem() == true) {
+				setenv("TZ", time_zone, 1);
+				tzset();
+			}
 
-	// uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-	// screen.printf("%lluMB\n", cardSize);
+			time_t currentEpoch;
+			struct tm timeInfo;
+			time(&currentEpoch);
+			localtime_r(&currentEpoch, &timeInfo);
 
-	// sensors.begin();
+			strftime(timeStamp, 32, time_format, &timeInfo);
+			ESP_LOGI("RTC Time", "%s", timeStamp);
 
-	// // Grab a count of devices on the wire
-	// int numberOfDevices = sensors.getDeviceCount();
+			pinMode(SPI_EN, OUTPUT);
+			digitalWrite(SPI_EN, HIGH);	 // 3V3_SPI_EN
 
-	// DeviceAddress tempDeviceAddress; // We'll use this variable to store a found device address
+			if (SD.begin(SD_CARD_CS)) {
+				uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+				ESP_LOGI("SD Card", "Size: %lluMB", cardSize);
+			} else {
+				ESP_LOGW("SD Card", "Mount Failed!");
+			}
 
-	// // locate devices on the bus
-	// Serial.print("Locating devices...");
+			pinMode(OUTPUT_EN, OUTPUT);
+			digitalWrite(OUTPUT_EN, HIGH);
 
-	// Serial.print("Found ");
-	// Serial.print(numberOfDevices, DEC);
-	// Serial.println(" devices.");
+			dallasSensors.begin();
 
-	// // report parasite power requirements
-	// Serial.print("Parasite power is: ");
-	// if (sensors.isParasitePowerMode()) Serial.println("ON");
-	// else Serial.println("OFF");
+			// call sensors.requestTemperatures() to issue a global temperature
+			// request to all devices on the bus
+			dallasSensors.requestTemperatures();  // Send the command to get temperatures
 
-	// // Loop through each device, print out address
-	// for (int i = 0; i < numberOfDevices; i++)
-	// {
-	// 	// Search the wire for address
-	// 	if (sensors.getAddress(tempDeviceAddress, i))
-	// 	{
-	// 		Serial.print("Found device ");
+			// After we got the temperatures, we can print them here.
+			// We use the function ByIndex, and as an example get the temperature from the first sensor only.
+			tempC = dallasSensors.getTempCByIndex(0);
 
-	// 		Serial.print("Setting resolution to ");
-	// 		Serial.println(TEMPERATURE_PRECISION, DEC);
+			// Check if reading was successful
+			if (tempC != DEVICE_DISCONNECTED_C) {
+				ESP_LOGI("Dallas", "Temperature for the device 1 (index 0) is:%f", tempC);
+			} else {
+				ESP_LOGW("Dallas", "Could not read temperature data");
+			}
 
-	// 		// set the resolution to TEMPERATURE_PRECISION bit (Each Dallas/Maxim device is capable of several different resolutions)
-	// 		sensors.setResolution(tempDeviceAddress, TEMPERATURE_PRECISION);
-	// 	} else {
-	// 		Serial.print("Found ghost device at ");
-	// 		Serial.print(i, DEC);
-	// 		Serial.print(" but could not detect address. Check power and cabling");
-	// 	}
-	// }
-	pinMode(12, INPUT);
-	attachInterrupt(12, ISR, HIGH);
+			file = SD.open("/data.csv", FILE_APPEND, true);
+			sprintf(buf, "%s,%4.0f", timeStamp, tempC);
+			file.println(buf);
+			file.close();
+
+
+
+			break;
+		default:
+			break;
+	}
 }
 
 void loop() {
-
-	// // call sensors.requestTemperatures() to issue a global temperature
-	// // request to all devices on the bus
-	// sensors.requestTemperatures(); // Send the command to get temperatures
-
-	// char buf[32];  // temp char array
-	// sprintf(buf, "%2.1f\n%2.1f\n%2.1f", sensors.getTempCByIndex(0), sensors.getTempCByIndex(1), sensors.getTempCByIndex(2));
-
-	// //Serial.println(millis());
-
-	// // Set "cursor" at top left corner of display (0,0) and select font (must include in platformio.ini)
-	// // (cursor will move to next line automatically during printing with 'screen.println'
-	// //  or stay on the line is there is room for the text with screen.print)
-	// screen.setCursor(0, 5, 6);
-
-	// // Set the font colour to be green with black background, set to font 2
-	// screen.setTextColor(screen_BLACK, screen_BLACK);
-	// screen.setTextFont(4);
-	// // screen.println(buf);
-	// screen.println("Test...");
-
-	vTaskDelay(100);
-
-	// delay(1000);
+	esp_sleep_enable_ext1_wakeup(DEEPSLEEP_INTERUPT_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
+	esp_sleep_enable_timer_wakeup(recordingIntervalSeconds * 1000000ULL);
+	ESP_LOGI("DeepSleep", "Going to sleep now");
+	esp_deep_sleep_start();
 }
