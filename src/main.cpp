@@ -2,7 +2,13 @@
 
 // #include <SPI.h>
 #include "USB.h"
+#if ARDUINO_USB_CDC_ON_BOOT
+#define HWSerial Serial0
+#define USBSerial Serial
+#else
+#define HWSerial Serial
 USBCDC USBSerial;
+#endif
 
 #include <SD.h>
 #include <tft_eSPI.h>
@@ -33,43 +39,14 @@ RTC_DATA_ATTR int batteryMilliVolts = 0;
 RTC_DATA_ATTR bool recording = false;
 RTC_DATA_ATTR int recordingIntervalSeconds = 10;
 RTC_DATA_ATTR int errorCounter = 0;
+RTC_DATA_ATTR int numberOfTempSensors;
 
-RTC_DATA_ATTR struct TempSensors {
-	uint8_t ID;
-	int nameAddr;  // pointer to descriptive name in EEPROM
-	int DSAddr;	   // pointer to address of the DS18B20
-	uint8_t pin;   // pin the DS18B20 was connected to
-} TS[20];
+struct TemperatureSensor {
+	DeviceAddress address;
+	float temperature;
+};
 
-void print_wakeup_reason() {
-	esp_sleep_wakeup_cause_t wakeup_reason;
-
-	wakeup_reason = esp_sleep_get_wakeup_cause();
-
-	int wakeup_pin = esp_sleep_get_ext1_wakeup_status();
-
-	switch (wakeup_reason) {
-		case ESP_SLEEP_WAKEUP_EXT0:
-			screen.println("ULP_GPIO");
-			break;
-		case ESP_SLEEP_WAKEUP_EXT1:
-			screen.print("ULP_GPIO_");
-			screen.println((log(wakeup_pin)) / log(2), 0);
-			break;
-		case ESP_SLEEP_WAKEUP_TIMER:
-			screen.println("ULP timer");
-			break;
-		case ESP_SLEEP_WAKEUP_TOUCHPAD:
-			screen.println("ULP touchpad");
-			break;
-		case ESP_SLEEP_WAKEUP_ULP:
-			screen.println("ULP program");
-			break;
-		default:
-			screen.println("External Reset");
-			break;
-	}
-}
+RTC_DATA_ATTR TemperatureSensor temperatureSensorList[10];
 
 void syncClock() {
 	// Define the NTP servers to be used for time synchronization
@@ -102,6 +79,8 @@ void setup() {
 	char timeStamp[32];
 	char buf[32];
 	File file;
+	int numberOfDevices;			  // Number of temperature devices found
+	DeviceAddress tempDeviceAddress;  // We'll use this variable to store a found device address
 
 	esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
 
@@ -121,6 +100,22 @@ void setup() {
 
 			pinMode(BACKLIGHT, OUTPUT);
 			analogWrite(BACKLIGHT, 256);
+
+			pinMode(OUTPUT_EN, OUTPUT);
+			digitalWrite(OUTPUT_EN, HIGH);
+
+			dallasSensors.begin();
+
+			// Grab a count of devices on the wire
+			numberOfTempSensors = dallasSensors.getDeviceCount();
+
+			for (int i = 0; i < numberOfTempSensors; i++) {
+				if (dallasSensors.getAddress(tempDeviceAddress, i)) {
+					dallasSensors.setResolution(tempDeviceAddress, 10);
+					memcpy(temperatureSensorList[i].address, tempDeviceAddress, sizeof(DeviceAddress));
+					temperatureSensorList[i].temperature = 0.0;	 // Initialize temperature if needed
+				}
+			}
 
 			analogSetPinAttenuation(VBAT_SENSE, ADC_0db);  // 0db (0 mV ~ 750 mV)
 			delay(300);
@@ -148,39 +143,33 @@ void setup() {
 			pinMode(SPI_EN, OUTPUT);
 			digitalWrite(SPI_EN, HIGH);	 // 3V3_SPI_EN
 
-			if (SD.begin(SD_CARD_CS)) {
-				uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-				ESP_LOGI("SD Card", "Size: %lluMB", cardSize);
-			} else {
+			if (!SD.begin(SD_CARD_CS)) {
 				ESP_LOGW("SD Card", "Mount Failed!");
 			}
 
 			pinMode(OUTPUT_EN, OUTPUT);
 			digitalWrite(OUTPUT_EN, HIGH);
 
-			dallasSensors.begin();
-
-			// call sensors.requestTemperatures() to issue a global temperature
-			// request to all devices on the bus
 			dallasSensors.requestTemperatures();  // Send the command to get temperatures
 
-			// After we got the temperatures, we can print them here.
-			// We use the function ByIndex, and as an example get the temperature from the first sensor only.
-			tempC = dallasSensors.getTempCByIndex(0);
+			// Loop through each sensor and retrieve temperature
+			for (int i = 0; i < numberOfTempSensors; i++) {
+				// Get temperature for the current sensor
+				tempC = dallasSensors.getTempC(temperatureSensorList[i].address);
 
-			// Check if reading was successful
-			if (tempC != DEVICE_DISCONNECTED_C) {
-				ESP_LOGI("Dallas", "Temperature for the device 1 (index 0) is:%f", tempC);
-			} else {
-				ESP_LOGW("Dallas", "Could not read temperature data");
+				// Check if reading was successful
+				if (tempC != DEVICE_DISCONNECTED_C) {
+					ESP_LOGI("Dallas", "Temperature %d is: %.1f", i, tempC);
+					temperatureSensorList[i].temperature = tempC;  // Update the temperature in the struct
+				} else {
+					ESP_LOGW("Dallas", "Could not read temperature data for device %d", i);
+				} 
 			}
 
 			file = SD.open("/data.csv", FILE_APPEND, true);
-			sprintf(buf, "%s,%4.0f", timeStamp, tempC);
+			sprintf(buf, "%s, %.2f", timeStamp, temperatureSensorList[0].temperature);
 			file.println(buf);
 			file.close();
-
-
 
 			break;
 		default:
