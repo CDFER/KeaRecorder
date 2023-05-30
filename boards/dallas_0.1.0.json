@@ -26,18 +26,18 @@
             "-DWIRE_SCL=9",
             "-DWIRE_SDA=8",
             "-DWIRE_RTC_INT=3",
-            "-DJST_UART_TX=16",
-            "-DJST_UART_RX=17",
+            "-DJST_UART_TX=17",
+            "-DJST_UART_RX=18",
             "-DJST_IO_1_1=4",
             "-DJST_IO_1_2=5",
             "-DJST_IO_2_1=6",
             "-DJST_IO_2_2=7",
-            "-DJST_IO_3_1=4",
-            "-DJST_IO_3_2=4"
+            "-DJST_IO_3_1=15",
+            "-DJST_IO_3_2=16"
         ],
         "f_cpu": "80000000L",
         "f_flash": "80000000L",
-        "flash_mode": "qio",
+        "flash_mode": "dio",
         "hwids": [
             [
                 "0x239A",
