@@ -8,6 +8,8 @@
 #include <tft_eSPI.h>
 TFT_eSPI screen = TFT_eSPI();
 
+#define SCREEN_ON_TIME 120
+
 #include <WiFi.h>
 const char* ssid = "";
 const char* password = "";
@@ -70,41 +72,54 @@ struct logFile {
 RTC_DATA_ATTR temperatureSensorBus oneWirePort[ONEWIRE_PORT_COUNT];
 RTC_DATA_ATTR sdCard microSDCard;
 
-void syncClock() {
-	// Define the NTP servers to be used for time synchronization
-	const char* ntpServer1 = "pool.ntp.org";
-	const char* ntpServer2 = "time.nist.gov";
-	const char* ntpServer3 = "time.google.com";
+bool systemTimeValid = false;
+char currentRecordingEpochtimeStamp[32];
 
-	// Set the SNTP operating mode to polling, and configure the NTP servers
-	sntp_setoperatingmode(SNTP_OPMODE_POLL);
-	sntp_setservername(0, ntpServer1);
-	sntp_setservername(1, ntpServer2);
-	sntp_setservername(2, ntpServer3);
-	sntp_init();
-
-	WiFi.begin(ssid, password);
-
-	do {
-		delay(10);
-	} while (!(sntp_getreachability(0) + sntp_getreachability(1) + sntp_getreachability(2) > 0));
-
-	rtc.syncToRtc();
-	WiFi.disconnect();
-	screen.println("sync to RTC");
-}
+bool recordingDot = true;
+bool displayOn;
 
 void clockManagerTask(void* parameter) {
 	Wire.begin(WIRE_SDA, WIRE_SCL, 100000);
-
 	rtc.begin(Wire);
 
 	if (rtc.syncToSystem() == true) {
 		setenv("TZ", time_zone, 1);
 		tzset();
+
+		systemTimeValid = true;
+	} else {
+		ESP_LOGE("Time", "NOT VALID");
 	}
 
-	tasksFinished++;
+	if (recording == true) {
+		struct tm timeInfo;
+		localtime_r(&currentRecordingEpoch, &timeInfo);
+		strftime(currentRecordingEpochtimeStamp, 32, time_format, &timeInfo);
+		ESP_LOGI("Time", "%s", currentRecordingEpochtimeStamp);
+
+	} else if (systemTimeValid == false) {
+		// Define the NTP servers to be used for time synchronization
+		const char* ntpServer1 = "pool.ntp.org";
+		const char* ntpServer2 = "time.nist.gov";
+		const char* ntpServer3 = "time.google.com";
+
+		// Set the SNTP operating mode to polling, and configure the NTP servers
+		sntp_setoperatingmode(SNTP_OPMODE_POLL);
+		sntp_setservername(0, ntpServer1);
+		sntp_setservername(1, ntpServer2);
+		sntp_setservername(2, ntpServer3);
+		sntp_init();
+
+		WiFi.begin(ssid, password);
+
+		do {
+			delay(10);
+		} while (!(sntp_getreachability(0) + sntp_getreachability(1) + sntp_getreachability(2) > 0));
+
+		rtc.syncToRtc();
+		WiFi.disconnect();
+	}
+
 	vTaskDelete(NULL);
 }
 
@@ -162,6 +177,22 @@ const char* calculateBatteryPercentage(uint16_t batteryMilliVolts) {
 	return batteryPercentage;
 }
 
+void enterDeepSleep() {
+	if (batteryMilliVolts > 3300) {
+		time_t currentEpoch;
+		time(&currentEpoch);
+		uint16_t secondsToNextRecording = currentRecordingEpoch - currentEpoch;
+		esp_sleep_enable_timer_wakeup(secondsToNextRecording * 1000000ULL);
+		ESP_LOGI("Going to sleep for", "%is", secondsToNextRecording);
+	} else {
+		ESP_LOGW("Battery", "Low Voltage, entering long sleep");
+	}
+
+	esp_sleep_enable_ext1_wakeup(DEEPSLEEP_INTERUPT_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
+	ESP_LOGI("DeepSleep", "Going to sleep now");
+	esp_deep_sleep_start();
+}
+
 const char* sdCardType(struct sdCard& cardInfo) {
 	const char* cardTypeString = "";
 
@@ -189,19 +220,6 @@ const char* sdCardType(struct sdCard& cardInfo) {
  * @param cardInfo Reference to the sdCard struct to populate.
  */
 void populateSDCardInfo(struct sdCard& cardInfo) {
-	pinMode(SPI_EN, OUTPUT);
-	pinMode(TFT_CS, OUTPUT);
-	pinMode(SD_CARD_CS, OUTPUT);
-
-	digitalWrite(SPI_EN, HIGH);
-	digitalWrite(TFT_CS, LOW);
-	digitalWrite(SD_CARD_CS, HIGH);
-
-	if (!SD.begin(SD_CARD_CS)) {
-		ESP_LOGW("SD Card", "Mount Failed!");
-		cardInfo.connected = false;
-	}
-
 	uint8_t cardType = SD.cardType();
 	cardInfo.connected = true;
 	cardInfo.cardType = cardType;
@@ -220,153 +238,120 @@ void populateSDCardInfo(struct sdCard& cardInfo) {
 	SD.end();
 }
 
-void screenManagerTask(void* parameter) {
-	bool recordingDot = true;
-
-	pinMode(SPI_EN, OUTPUT);
-	pinMode(TFT_CS, OUTPUT);
-	pinMode(SD_CARD_CS, OUTPUT);
-
-	digitalWrite(SPI_EN, HIGH);
-	digitalWrite(TFT_CS, HIGH);
-	digitalWrite(SD_CARD_CS, LOW);
-
-	pinMode(BACKLIGHT, OUTPUT);
-	analogWrite(BACKLIGHT, 256);
-
-	screen.begin();
-	screen.setRotation(2);
-	// screen.setRotation(3);
-	screen.fillScreen(TFT_BLACK);
-
-	while (true) {
-		screen.setTextColor(TFT_WHITE, TFT_BLACK, true);  // fills background to wipe previous text
-
-		// Draw REC symbol
-		if (recordingDot == true) {
-			screen.fillSmoothCircle(8 + 10, 8 + 10, 10, TFT_RED);
-			screen.drawString("REC", 34, 8, 4);
-		} else {
-			screen.fillSmoothCircle(8 + 10, 8 + 10, 10, TFT_BLACK);
-		}
-		recordingDot = !recordingDot;
-
-		// Draw Battery Percentage
-		screen.drawString(calculateBatteryPercentage(batteryMilliVolts), 112, 8, 4);
-
-		// Draw Temerature Values
-		uint8_t yPosition = 36;
-
-		for (uint8_t i = 0; i < ONEWIRE_PORT_COUNT; i++) {
-			if (oneWirePort[i].numberOfSensors > 0) {
-				screen.drawWideLine(6, yPosition, 6, yPosition + (oneWirePort[i].numberOfSensors - 1) * 26 + 20, 5, oneWirePort[i].color);	// draw color bar to indicate bus
-
-				for (uint8_t j = 0; j < oneWirePort[i].numberOfSensors; j++) {
-					screen.drawString(deviceAddressto4Char(oneWirePort[i].sensorList[j].address), 12, yPosition, 4);
-
-					screen.drawFloat(oneWirePort[i].sensorList[j].temperature, 1, 12 + (4 * 20), yPosition, 4);
-					screen.drawString("`c", 12 + (4 * 20) + 50, yPosition, 4);
-
-					// screen.setCursor(12 + (4 * 20), yPosition, 4);
-					// screen.printf("%2.1f`C", oneWirePort[i].sensorList[j].temperature);
-					yPosition += 26;
-				}
-
-				yPosition += 13;
-			}
-		}
-
-		screen.setTextColor(TFT_DARKGREY, TFT_BLACK, true);	 // fills background to wipe previous text
-		screen.setCursor(8, 285, 2);
-		if (microSDCard.connected == true) {
-			screen.printf("%i/%iGiB %s", microSDCard.cardUsedGib, microSDCard.cardTotalGib, sdCardType(microSDCard));
-		} else {
-			screen.printf("No SD card");
-		}
-
-		// Draw Clock
-		struct tm timeInfo;
-		char dateTime[32];
-		time_t currentEpoch;
-		time(&currentEpoch);
-		localtime_r(&currentRecordingEpoch, &timeInfo);
-		strftime(dateTime, 32, "%d/%b/%Y %H:%M", &timeInfo);
-
-		screen.drawString(dateTime, 8, 300, 2);
-
-		vTaskDelay(500 / portTICK_PERIOD_MS);
-
-		// vTaskSuspend(NULL);	 // Wait for new info
-	}
-}
-
 void writeLineToSDcard() {
-	pinMode(SPI_EN, OUTPUT);
-	pinMode(TFT_CS, OUTPUT);
-	pinMode(SD_CARD_CS, OUTPUT);
-
-	struct tm timeInfo;
-	char timeStamp[32];
 	File file;
 	char buf[64];
 
-	localtime_r(&currentRecordingEpoch, &timeInfo);
-
-	strftime(timeStamp, 32, time_format, &timeInfo);
-	ESP_LOGI("Time", "%s", timeStamp);
-
-	sprintf(buf, "%s,%i,%.2f,%.2f,%.2f", timeStamp, batteryMilliVolts, oneWirePort[1].sensorList[0].temperature, oneWirePort[1].sensorList[1].temperature, oneWirePort[1].sensorList[2].temperature);
-
-	digitalWrite(SPI_EN, HIGH);
-	digitalWrite(TFT_CS, LOW);
-	digitalWrite(SD_CARD_CS, HIGH);
-
-	if (!SD.begin(SD_CARD_CS)) {
-		ESP_LOGW("SD Card", "Mount Failed!");
-	}
+	sprintf(buf, "%s,%i,%.2f,%.2f,%.2f", currentRecordingEpochtimeStamp, batteryMilliVolts, oneWirePort[1].sensorList[0].temperature, oneWirePort[1].sensorList[1].temperature, oneWirePort[1].sensorList[2].temperature);
 
 	file = SD.open("/data.csv", FILE_APPEND, true);
 	file.println(buf);
 	file.close();
-
-	digitalWrite(SPI_EN, LOW);
-
-	ESP_LOGD("data Written to file", "");
 }
 
-void readOneWireTemperaturesToSD(void* parameter) {
-	pinMode(OUTPUT_EN, OUTPUT);
-	digitalWrite(OUTPUT_EN, HIGH);
+void initScreen() {
+	screen.begin();
+	screen.setRotation(2);
+	screen.fillScreen(TFT_BLACK);
 
-	for (uint8_t i = 0; i < ONEWIRE_PORT_COUNT; i++) {
-		if (oneWirePort[i].numberOfSensors > 0) {
-			oneWirePort[i].oneWireBus.begin(oneWirePort[i].oneWirePin);
-			oneWirePort[i].dallasTemperatureBus.setOneWire(&oneWirePort[i].oneWireBus);	 // Sets up pointer to oneWire Instance
-			oneWirePort[i].dallasTemperatureBus.setWaitForConversion(false);
-			oneWirePort[i].dallasTemperatureBus.requestTemperatures();
-			ESP_LOGD("requested Temperatures on", "bus: %i", i);
-		}
+	pinMode(BACKLIGHT, OUTPUT);
+	analogWrite(BACKLIGHT, 256);
+}
+
+void updateScreen() {
+	screen.setTextColor(TFT_WHITE, TFT_BLACK, true);  // fills background to wipe previous text
+
+	// Draw REC symbol
+	if (recordingDot == true) {
+		screen.fillSmoothCircle(8 + 10, 8 + 10, 10, TFT_RED);
+		screen.drawString("REC", 34, 8, 4);
+	} else {
+		screen.fillSmoothCircle(8 + 10, 8 + 10, 10, TFT_BLACK);
 	}
+	recordingDot = !recordingDot;
 
-	vTaskDelay(750 / portTICK_PERIOD_MS);
+	// Draw Battery Percentage
+	screen.drawString(calculateBatteryPercentage(batteryMilliVolts), 112, 8, 4);
+
+	// Draw Temerature Values
+	uint8_t yPosition = 36;
 
 	for (uint8_t i = 0; i < ONEWIRE_PORT_COUNT; i++) {
 		if (oneWirePort[i].numberOfSensors > 0) {
+			screen.drawWideLine(6, yPosition, 6, yPosition + (oneWirePort[i].numberOfSensors - 1) * 26 + 20, 5, oneWirePort[i].color);	// draw color bar to indicate bus
+
 			for (uint8_t j = 0; j < oneWirePort[i].numberOfSensors; j++) {
-				oneWirePort[i].sensorList[j].temperature = oneWirePort[i].dallasTemperatureBus.getTempC(oneWirePort[i].sensorList[j].address);
-				ESP_LOGD("got", " %.2f for bus %i sensor %i", oneWirePort[i].sensorList[j].temperature, i, j);
+				screen.drawString(deviceAddressto4Char(oneWirePort[i].sensorList[j].address), 12, yPosition, 4);
+
+				screen.drawFloat(oneWirePort[i].sensorList[j].temperature, 1, 12 + (4 * 20), yPosition, 4);
+				screen.drawString("`c", 12 + (4 * 20) + 50, yPosition, 4);
+
+				// screen.setCursor(12 + (4 * 20), yPosition, 4);
+				// screen.printf("%2.1f`C", oneWirePort[i].sensorList[j].temperature);
+				yPosition += 26;
 			}
+
+			yPosition += 13;
 		}
 	}
-	digitalWrite(OUTPUT_EN, LOW);
 
-	// writeLineToSDcard();
+	screen.setTextColor(TFT_DARKGREY, TFT_BLACK, true);	 // fills background to wipe previous text
+	screen.setCursor(8, 285, 2);
+	if (microSDCard.connected == true) {
+		screen.printf("%i/%iGiB %s", microSDCard.cardUsedGib, microSDCard.cardTotalGib, sdCardType(microSDCard));
+	} else {
+		screen.printf("No SD card");
+	}
 
-	tasksFinished++;
+	// Draw Clock
+	struct tm timeInfo;
+	char dateTime[32];
+	time_t currentEpoch;
+	time(&currentEpoch);
+	localtime_r(&currentRecordingEpoch, &timeInfo);
+	strftime(dateTime, 32, "%d/%b/%Y %H:%M", &timeInfo);
+
+	screen.drawString(dateTime, 8, 300, 2);
+}
+
+void SPIManagerTask(void* parameter) {
+	pinMode(SPI_EN, OUTPUT);
+	pinMode(TFT_CS, OUTPUT);
+	pinMode(SD_CARD_CS, OUTPUT);
+
+	digitalWrite(SPI_EN, HIGH);
+	digitalWrite(TFT_CS, LOW);
+	digitalWrite(SD_CARD_CS, LOW);
+
+	if (SD.begin(SD_CARD_CS)) {
+		if (displayOn == true) {
+			populateSDCardInfo(microSDCard);
+		} else {
+			vTaskSuspend(NULL);	 // Wait for new info
+			writeLineToSDcard();
+			enterDeepSleep();
+		}
+
+	} else {
+		ESP_LOGW("SD Card", "Mount Failed!");
+		microSDCard.connected = false;
+	}
+
+	digitalWrite(SD_CARD_CS, LOW);
+	digitalWrite(TFT_CS, HIGH);
+	initScreen();
+
+	while (millis() <= SCREEN_ON_TIME * 1000) {
+		updateScreen();
+		vTaskDelay(500 / portTICK_PERIOD_MS);
+	}
+
+	enterDeepSleep();
+
 	vTaskDelete(NULL);
 }
 
-void scanOneWireAddresses() {
+void scanOneWireBusses() {
 	DeviceAddress tempAddress;	// We'll use this variable to store a found device address
 
 	oneWirePort[0].oneWirePin = (JST_IO_1_1);
@@ -385,7 +370,7 @@ void scanOneWireAddresses() {
 		oneWirePort[i].dallasTemperatureBus.setOneWire(&oneWirePort[i].oneWireBus);				// Sets up pointer to oneWire Instance
 		oneWirePort[i].dallasTemperatureBus.begin();											// Sets up and Scans the Bus
 		oneWirePort[i].numberOfSensors = oneWirePort[i].dallasTemperatureBus.getDeviceCount();	// Grab a count of devices on the wire
-		ESP_LOGD("Found Sensors on", "bus: %i, %i sensors", i, oneWirePort[i].numberOfSensors);
+		// ESP_LOGD("Found Sensors on", "bus: %i, %i sensors", i, oneWirePort[i].numberOfSensors);
 
 		if (oneWirePort[i].numberOfSensors > 0) {
 			for (uint8_t j = 0; j < oneWirePort[i].numberOfSensors; j++) {
@@ -396,7 +381,41 @@ void scanOneWireAddresses() {
 			}
 		}
 	}
+}
+
+void readOneWireTemperaturesTask(void* parameter) {
+	pinMode(OUTPUT_EN, OUTPUT);
+	digitalWrite(OUTPUT_EN, HIGH);
+
+	do {
+		if (recording == false) {
+			scanOneWireBusses();
+		}
+
+		for (uint8_t i = 0; i < ONEWIRE_PORT_COUNT; i++) {
+			if (oneWirePort[i].numberOfSensors > 0) {
+				oneWirePort[i].oneWireBus.begin(oneWirePort[i].oneWirePin);
+				oneWirePort[i].dallasTemperatureBus.setOneWire(&oneWirePort[i].oneWireBus);	 // Sets up pointer to oneWire Instance
+				oneWirePort[i].dallasTemperatureBus.setWaitForConversion(false);
+				oneWirePort[i].dallasTemperatureBus.requestTemperatures();
+				// ESP_LOGD("requested Temperatures on", "bus: %i", i);
+			}
+		}
+
+		vTaskDelay(750 / portTICK_PERIOD_MS);
+
+		for (uint8_t i = 0; i < ONEWIRE_PORT_COUNT; i++) {
+			if (oneWirePort[i].numberOfSensors > 0) {
+				for (uint8_t j = 0; j < oneWirePort[i].numberOfSensors; j++) {
+					oneWirePort[i].sensorList[j].temperature = oneWirePort[i].dallasTemperatureBus.getTempC(oneWirePort[i].sensorList[j].address);
+					// ESP_LOGD("got", " %.2f for bus %i sensor %i", oneWirePort[i].sensorList[j].temperature, i, j);
+				}
+			}
+		}
+	} while (displayOn == true);
+
 	digitalWrite(OUTPUT_EN, LOW);
+	vTaskDelete(NULL);
 }
 
 void readBatteryVoltageTask(void* parameter) {
@@ -404,14 +423,7 @@ void readBatteryVoltageTask(void* parameter) {
 	vTaskDelay(300 / portTICK_PERIOD_MS);
 	batteryMilliVolts = analogReadMilliVolts(VBAT_SENSE) * VBAT_SENSE_SCALE;
 	ESP_LOGD("Battery Voltage", "%imV", batteryMilliVolts);
-	tasksFinished++;
 	vTaskDelete(NULL);
-}
-
-void enterDeepSleep() {
-	esp_sleep_enable_ext1_wakeup(DEEPSLEEP_INTERUPT_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
-	ESP_LOGI("DeepSleep", "Going to sleep now");
-	esp_deep_sleep_start();
 }
 
 void setup() {
@@ -422,31 +434,15 @@ void setup() {
 
 	switch (wakeup_reason) {
 		case ESP_SLEEP_WAKEUP_TIMER:
+			currentRecordingEpoch += recordingIntervalSeconds;
+
 			ESP_LOGI("Woken by", "Timer");
-			tasksFinished = 0;
-			xTaskCreate(readOneWireTemperaturesToSD, "readOneWireTemperaturesToSD", 10000, NULL, 1, NULL);
-			vTaskDelay(50 / portTICK_PERIOD_MS);
+			displayOn = false;
+
+			xTaskCreate(readOneWireTemperaturesTask, "readOneWireTemperatures", 10000, NULL, 1, NULL);
+			xTaskCreate(SPIManagerTask, "SPIManagerTask", 5000, NULL, 1, NULL);
 			xTaskCreate(readBatteryVoltageTask, "readBatteryVoltageTask", 5000, NULL, 3, NULL);
 			xTaskCreate(clockManagerTask, "clockManagerTask", 5000, NULL, 3, NULL);
-
-			vTaskDelay(900 / portTICK_PERIOD_MS);
-
-			while (tasksFinished < 3) {
-				vTaskDelay(30 / portTICK_PERIOD_MS);
-			}
-
-			if (batteryMilliVolts > 3300) {
-				currentRecordingEpoch += recordingIntervalSeconds;
-
-				time_t currentEpoch;
-				time(&currentEpoch);
-				uint16_t secondsToNextRecording = currentRecordingEpoch - currentEpoch;
-				esp_sleep_enable_timer_wakeup(secondsToNextRecording * 1000000ULL);
-				ESP_LOGI("Going to sleep for", "%is", secondsToNextRecording);
-			} else {
-				ESP_LOGW("Battery", "Low Voltage, entering long sleep");
-			}
-			enterDeepSleep();
 
 			break;
 
@@ -454,27 +450,12 @@ void setup() {
 		case ESP_SLEEP_WAKEUP_EXT1:
 		default:
 			ESP_LOGI("Woken by", "Button");
-			populateSDCardInfo(microSDCard);
+			displayOn = true;
 
-			vTaskDelay(1000 / portTICK_PERIOD_MS);
-
-			xTaskCreate(screenManagerTask, "screenManagerTask", 5000, NULL, 1, NULL);
+			xTaskCreate(SPIManagerTask, "SPIManagerTask", 5000, NULL, 1, NULL);
 			xTaskCreate(readBatteryVoltageTask, "readBatteryVoltageTask", 5000, NULL, 1, NULL);
-			scanOneWireAddresses();
-			// xTaskCreate(readOneWireTemperaturesToSD, "readOneWireTemperaturesToSD", 10000, NULL, 1, NULL);
-			vTaskDelay(1200000 / portTICK_PERIOD_MS);
-
-			if (batteryMilliVolts > 3300) {
-				time_t currentEpoch;
-				time(&currentEpoch);
-				uint16_t secondsToNextRecording = currentRecordingEpoch - currentEpoch;
-				esp_sleep_enable_timer_wakeup(secondsToNextRecording * 1000000ULL);
-				ESP_LOGI("Going to sleep for", "%is", secondsToNextRecording);
-			} else {
-				ESP_LOGW("Battery", "Low Voltage, entering long sleep");
-			}
-
-			enterDeepSleep();
+			xTaskCreate(clockManagerTask, "clockManagerTask", 5000, NULL, 1, NULL);
+			xTaskCreate(readOneWireTemperaturesTask, "readOneWireTemperaturesTask", 10000, NULL, 1, NULL);
 
 			break;
 	}
