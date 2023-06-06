@@ -1,6 +1,12 @@
 {
     "files.associations": {
         "*.html": "html",
-        "cmath": "cpp"
+        "cmath": "cpp",
+        "atomic": "cpp",
+        "optional": "cpp",
+        "new": "cpp",
+        "streambuf": "cpp",
+        "functional": "cpp",
+        "typeinfo": "cpp"
     }
 }

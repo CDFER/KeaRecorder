@@ -2,7 +2,7 @@
 
 #include "USB.h"
 #define HWSerial Serial
-//USBCDC USBSerial;
+// USBCDC USBSerial;
 
 #include <SD.h>
 #include <tft_eSPI.h>
@@ -27,7 +27,7 @@ const char* time_format = "%d/%m/%y,%H:%M:%S";
 RTC_DATA_ATTR uint16_t bootCount = 0;
 RTC_DATA_ATTR uint16_t batteryMilliVolts = 0;
 RTC_DATA_ATTR bool recording = false;
-RTC_DATA_ATTR uint16_t recordingIntervalSeconds = 5;
+RTC_DATA_ATTR uint16_t recordingIntervalSeconds = 900;
 RTC_DATA_ATTR time_t currentRecordingEpoch;
 RTC_DATA_ATTR uint16_t errorCounter = 0;
 
@@ -48,9 +48,27 @@ struct temperatureSensorBus {
 	OneWire oneWireBus;
 	DallasTemperature dallasTemperatureBus;
 	temperatureSensor sensorList[5];
+	uint32_t color;
+};
+
+/**
+ * @brief Structure to hold SD card information.
+ */
+struct sdCard {
+	uint8_t cardTotalGib;	/** Card size in GiB. */
+	uint8_t cardUsedGib;	/** Card space used in GiB. */
+	uint8_t cardType;		/** Card type. */
+	bool connected = false; /** Flag indicating if an SD card is connected. */
+};
+
+struct logFile {
+	uint16_t sizeMib;
+	uint16_t datapoints;
+	char* filename;
 };
 
 RTC_DATA_ATTR temperatureSensorBus oneWirePort[ONEWIRE_PORT_COUNT];
+RTC_DATA_ATTR sdCard microSDCard;
 
 void syncClock() {
 	// Define the NTP servers to be used for time synchronization
@@ -90,7 +108,121 @@ void clockManagerTask(void* parameter) {
 	vTaskDelete(NULL);
 }
 
+// Function to extract the first hex character from byte 1, 3, 5, and 7 of a DeviceAddress
+char* deviceAddressto4Char(const DeviceAddress& address) {
+	static char result[5];	// Static array to hold the extracted hex characters
+	result[4] = '\0';		// Null-terminate the result array
+
+	// Extract the hex characters from bytes 1, 3, 5, and 7
+	result[0] = "0123456789ABCDEF"[(address[1] >> 4) & 0x0F];
+	result[1] = "0123456789ABCDEF"[(address[3] >> 4) & 0x0F];
+	result[2] = "0123456789ABCDEF"[(address[5] >> 4) & 0x0F];
+	result[3] = "0123456789ABCDEF"[(address[7] >> 4) & 0x0F];
+
+	return result;
+}
+
+/**
+ * @brief Calculate battery percentage based on voltage using a lookup table.
+ *
+ * Lookup table for battery voltage in millivolts and corresponding percentage (based on PANASONIC_NCR_18650_B).
+ * battery voltage 3300 = 3.3V, state of charge 22 = 22%.
+ */
+const uint16_t batteryDischargeCurve[2][10] = {
+	{3300, 3400, 3500, 3600, 3700, 3800, 3900, 4000, 4100, 4200},
+	{0, 13, 22, 39, 53, 62, 74, 84, 94, 100}};
+
+/**
+ * @brief Calculate battery percentage based on voltage.
+ *
+ * @param batteryMilliVolts The battery voltage in millivolts.
+ * @return The battery percentage as a null-terminated char array.
+ */
+const char* calculateBatteryPercentage(uint16_t batteryMilliVolts) {
+	static char batteryPercentage[5];  // Static array to hold the battery percentage
+	batteryPercentage[4] = '\0';	   // Null-terminate the array
+
+	uint8_t tableSize = sizeof(batteryDischargeCurve[0]) / sizeof(batteryDischargeCurve[0][0]);
+	uint8_t percentage = 0;
+	for (uint8_t i = 0; i < tableSize - 1; i++) {  // loop through table to find the two lookup values we are between
+		if (batteryMilliVolts <= batteryDischargeCurve[0][i + 1]) {
+			// x axis is millivolts, y axis is charge percentage interpolation to find the battery percentage
+			uint16_t x0 = batteryDischargeCurve[0][i];
+			uint16_t x1 = batteryDischargeCurve[0][i + 1];
+			uint8_t y0 = batteryDischargeCurve[1][i];
+			uint8_t y1 = batteryDischargeCurve[1][i + 1];
+			percentage = static_cast<uint8_t>(y0 + ((y1 - y0) * (batteryMilliVolts - x0)) / (x1 - x0));
+			break;
+		}
+	}
+
+	// Convert the percentage to a char array
+	snprintf(batteryPercentage, sizeof(batteryPercentage), "%d%%", percentage);
+
+	return batteryPercentage;
+}
+
+const char* sdCardType(struct sdCard& cardInfo) {
+	const char* cardTypeString = "";
+
+	if (cardInfo.cardType == CARD_NONE) {
+		Serial.println("No SD card attached");
+	} else {
+		Serial.print("SD Card Type: ");
+		if (cardInfo.cardType == CARD_MMC) {
+			cardTypeString = "MMC";
+		} else if (cardInfo.cardType == CARD_SD) {
+			cardTypeString = "SDSC";
+		} else if (cardInfo.cardType == CARD_SDHC) {
+			cardTypeString = "SDHC";
+		} else {
+			cardTypeString = "UNKNOWN";
+		}
+		Serial.println(cardTypeString);
+	}
+	return cardTypeString;
+}
+
+/**
+ * @brief Populates the provided sdCard struct with information about the connected SD card.
+ *
+ * @param cardInfo Reference to the sdCard struct to populate.
+ */
+void populateSDCardInfo(struct sdCard& cardInfo) {
+	pinMode(SPI_EN, OUTPUT);
+	pinMode(TFT_CS, OUTPUT);
+	pinMode(SD_CARD_CS, OUTPUT);
+
+	digitalWrite(SPI_EN, HIGH);
+	digitalWrite(TFT_CS, LOW);
+	digitalWrite(SD_CARD_CS, HIGH);
+
+	if (!SD.begin(SD_CARD_CS)) {
+		ESP_LOGW("SD Card", "Mount Failed!");
+		cardInfo.connected = false;
+	}
+
+	uint8_t cardType = SD.cardType();
+	cardInfo.connected = true;
+	cardInfo.cardType = cardType;
+
+	if (cardType == CARD_NONE) {
+		Serial.println("No SD card attached");
+		return;
+	}
+
+	uint64_t cardSize = SD.totalBytes() / (1024 * 1024 * 1024);
+	cardInfo.cardTotalGib = static_cast<uint8_t>(cardSize);
+
+	uint64_t usedSize = SD.usedBytes() / (1024 * 1024 * 1024);
+	cardInfo.cardUsedGib = static_cast<uint8_t>(usedSize);
+
+	SD.end();
+}
+
 void screenManagerTask(void* parameter) {
+	bool recordingDot = true;
+
 	pinMode(SPI_EN, OUTPUT);
 	pinMode(TFT_CS, OUTPUT);
 	pinMode(SD_CARD_CS, OUTPUT);
@@ -103,14 +235,68 @@ void screenManagerTask(void* parameter) {
 	analogWrite(BACKLIGHT, 256);
 
 	screen.begin();
-	screen.setRotation(3);
+	screen.setRotation(2);
+	// screen.setRotation(3);
 	screen.fillScreen(TFT_BLACK);
 
 	while (true) {
-		screen.setTextColor(TFT_WHITE);
-		screen.setTextFont(4);
-		screen.println("XXX");
-		vTaskSuspend(NULL);	 // Wait for new info
+		screen.setTextColor(TFT_WHITE, TFT_BLACK, true);  // fills background to wipe previous text
+
+		// Draw REC symbol
+		if (recordingDot == true) {
+			screen.fillSmoothCircle(8 + 10, 8 + 10, 10, TFT_RED);
+			screen.drawString("REC", 34, 8, 4);
+		} else {
+			screen.fillSmoothCircle(8 + 10, 8 + 10, 10, TFT_BLACK);
+		}
+		recordingDot = !recordingDot;
+
+		// Draw Battery Percentage
+		screen.drawString(calculateBatteryPercentage(batteryMilliVolts), 112, 8, 4);
+
+		// Draw Temerature Values
+		uint8_t yPosition = 36;
+
+		for (uint8_t i = 0; i < ONEWIRE_PORT_COUNT; i++) {
+			if (oneWirePort[i].numberOfSensors > 0) {
+				screen.drawWideLine(6, yPosition, 6, yPosition + (oneWirePort[i].numberOfSensors - 1) * 26 + 20, 5, oneWirePort[i].color);	// draw color bar to indicate bus
+
+				for (uint8_t j = 0; j < oneWirePort[i].numberOfSensors; j++) {
+					screen.drawString(deviceAddressto4Char(oneWirePort[i].sensorList[j].address), 12, yPosition, 4);
+
+					screen.drawFloat(oneWirePort[i].sensorList[j].temperature, 1, 12 + (4 * 20), yPosition, 4);
+					screen.drawString("`c", 12 + (4 * 20) + 50, yPosition, 4);
+
+					// screen.setCursor(12 + (4 * 20), yPosition, 4);
+					// screen.printf("%2.1f`C", oneWirePort[i].sensorList[j].temperature);
+					yPosition += 26;
+				}
+
+				yPosition += 13;
+			}
+		}
+
+		screen.setTextColor(TFT_DARKGREY, TFT_BLACK, true);	 // fills background to wipe previous text
+		screen.setCursor(8, 285, 2);
+		if (microSDCard.connected == true) {
+			screen.printf("%i/%iGiB %s", microSDCard.cardUsedGib, microSDCard.cardTotalGib, sdCardType(microSDCard));
+		} else {
+			screen.printf("No SD card");
+		}
+
+		// Draw Clock
+		struct tm timeInfo;
+		char dateTime[32];
+		time_t currentEpoch;
+		time(&currentEpoch);
+		localtime_r(&currentRecordingEpoch, &timeInfo);
+		strftime(dateTime, 32, "%d/%b/%Y %H:%M", &timeInfo);
+
+		screen.drawString(dateTime, 8, 300, 2);
+
+		vTaskDelay(500 / portTICK_PERIOD_MS);
+
+		// vTaskSuspend(NULL);	 // Wait for new info
 	}
 }
 
@@ -174,7 +360,7 @@ void readOneWireTemperaturesToSD(void* parameter) {
 	}
 	digitalWrite(OUTPUT_EN, LOW);
 
-	writeLineToSDcard();
+	// writeLineToSDcard();
 
 	tasksFinished++;
 	vTaskDelete(NULL);
@@ -186,6 +372,10 @@ void scanOneWireAddresses() {
 	oneWirePort[0].oneWirePin = (JST_IO_1_1);
 	oneWirePort[1].oneWirePin = (JST_IO_2_1);
 	oneWirePort[2].oneWirePin = (JST_IO_3_1);
+
+	oneWirePort[0].color = TFT_RED;
+	oneWirePort[1].color = TFT_GREEN;
+	oneWirePort[2].color = TFT_BLUE;
 
 	pinMode(OUTPUT_EN, OUTPUT);
 	digitalWrite(OUTPUT_EN, HIGH);
@@ -231,27 +421,6 @@ void setup() {
 	esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
 
 	switch (wakeup_reason) {
-		case ESP_SLEEP_WAKEUP_EXT0:
-		case ESP_SLEEP_WAKEUP_EXT1:
-			ESP_LOGI("Woken by", "Button");
-			xTaskCreate(screenManagerTask, "screenManagerTask", 5000, NULL, 1, NULL);
-			xTaskCreate(readBatteryVoltageTask, "readBatteryVoltageTask", 5000, NULL, 1, NULL);
-			scanOneWireAddresses();
-			vTaskDelay(5000 / portTICK_PERIOD_MS);
-
-			if (batteryMilliVolts > 3300) {
-				time_t currentEpoch;
-				time(&currentEpoch);
-				uint16_t secondsToNextRecording = currentRecordingEpoch - currentEpoch;
-				esp_sleep_enable_timer_wakeup(secondsToNextRecording * 1000000ULL);
-				ESP_LOGI("Going to sleep for", "%is", secondsToNextRecording);
-			} else {
-				ESP_LOGW("Battery", "Low Voltage, entering long sleep");
-			}
-
-			enterDeepSleep();
-
-			break;
 		case ESP_SLEEP_WAKEUP_TIMER:
 			ESP_LOGI("Woken by", "Timer");
 			tasksFinished = 0;
@@ -281,16 +450,30 @@ void setup() {
 
 			break;
 
+		case ESP_SLEEP_WAKEUP_EXT0:
+		case ESP_SLEEP_WAKEUP_EXT1:
 		default:
-			ESP_LOGI("Woken by", "Other");
-			xTaskCreate(clockManagerTask, "clockManagerTask", 5000, NULL, 1, NULL);
-			scanOneWireAddresses();
+			ESP_LOGI("Woken by", "Button");
+			populateSDCardInfo(microSDCard);
+
 			vTaskDelay(1000 / portTICK_PERIOD_MS);
-			time_t currentEpoch;
-			time(&currentEpoch);
-			currentRecordingEpoch = currentEpoch + recordingIntervalSeconds;
-			esp_sleep_enable_timer_wakeup(recordingIntervalSeconds * 1000000ULL);
-			ESP_LOGI("Going to sleep for", "%is", recordingIntervalSeconds);
+
+			xTaskCreate(screenManagerTask, "screenManagerTask", 5000, NULL, 1, NULL);
+			xTaskCreate(readBatteryVoltageTask, "readBatteryVoltageTask", 5000, NULL, 1, NULL);
+			scanOneWireAddresses();
+			// xTaskCreate(readOneWireTemperaturesToSD, "readOneWireTemperaturesToSD", 10000, NULL, 1, NULL);
+			vTaskDelay(1200000 / portTICK_PERIOD_MS);
+
+			if (batteryMilliVolts > 3300) {
+				time_t currentEpoch;
+				time(&currentEpoch);
+				uint16_t secondsToNextRecording = currentRecordingEpoch - currentEpoch;
+				esp_sleep_enable_timer_wakeup(secondsToNextRecording * 1000000ULL);
+				ESP_LOGI("Going to sleep for", "%is", secondsToNextRecording);
+			} else {
+				ESP_LOGW("Battery", "Low Voltage, entering long sleep");
+			}
+
 			enterDeepSleep();
 
 			break;
