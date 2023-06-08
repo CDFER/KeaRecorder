@@ -11,8 +11,15 @@ TFT_eSPI screen = TFT_eSPI();
 #define SCREEN_ON_TIME 120
 
 #include <WiFi.h>
-const char* ssid = "";
-const char* password = "";
+#include "credentials.h"
+
+#ifndef CREDENTIALS_H
+#define CREDENTIALS_H
+
+#define WIFI_WIFI_SSID "YourWIFI"
+#define WIFI_PW "PASSWORD"
+
+#endif
 
 #include "pcf8563.h"  // pcf8563 (Backup RTC Clock)
 #include "sntp.h"
@@ -25,15 +32,13 @@ const char* time_format = "%d/%m/%y,%H:%M:%S";
 #include <OneWire.h>
 
 #define DEEPSLEEP_INTERUPT_BITMASK pow(2, WAKE_BUTTON) + pow(2, UP_BUTTON) + pow(2, DOWN_BUTTON)
+#define HOLD_DURATION 3000  // Hold duration in milliseconds to start and end recording
 
 RTC_DATA_ATTR uint16_t bootCount = 0;
 RTC_DATA_ATTR uint16_t batteryMilliVolts = 0;
 RTC_DATA_ATTR bool recording = false;
 RTC_DATA_ATTR uint16_t recordingIntervalSeconds = 900;
 RTC_DATA_ATTR time_t currentRecordingEpoch;
-RTC_DATA_ATTR uint16_t errorCounter = 0;
-
-uint8_t tasksFinished = 0;
 
 #define ONEWIRE_TEMP_RESOLUTION 12
 #define ONEWIRE_PORT_COUNT 3
@@ -78,6 +83,38 @@ char currentRecordingEpochtimeStamp[32];
 bool recordingDot = true;
 bool displayOn;
 
+SemaphoreHandle_t buttonSemaphore;
+
+void buttonInterrupt() {
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	xSemaphoreGiveFromISR(buttonSemaphore, &xHigherPriorityTaskWoken);
+	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+void buttonTask(void* pvParameters) {
+	TickType_t lastWakeTime = xTaskGetTickCount();
+
+	while (1) {
+		if (xSemaphoreTake(buttonSemaphore, portMAX_DELAY) == pdTRUE) {
+			if (digitalRead(WAKE_BUTTON) == HIGH) {
+				vTaskDelay(HOLD_DURATION/ portTICK_PERIOD_MS);
+
+				if (digitalRead(WAKE_BUTTON) == HIGH) {
+					if (recording == true) {
+						recording = false;
+
+					} else {
+						recording = true;
+
+					}
+				}
+			}
+		}
+
+		vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(10));	// Check every 10 milliseconds for inturpt semaphore
+	}
+}
+
 void clockManagerTask(void* parameter) {
 	Wire.begin(WIRE_SDA, WIRE_SCL, 100000);
 	rtc.begin(Wire);
@@ -110,7 +147,7 @@ void clockManagerTask(void* parameter) {
 		sntp_setservername(2, ntpServer3);
 		sntp_init();
 
-		WiFi.begin(ssid, password);
+		WiFi.begin(WIFI_SSID, WIFI_PW);
 
 		do {
 			delay(10);
@@ -177,19 +214,35 @@ const char* calculateBatteryPercentage(uint16_t batteryMilliVolts) {
 	return batteryPercentage;
 }
 
+/**
+ * @brief Enters deep sleep mode based on the battery voltage and current epoch time.
+ *
+ */
 void enterDeepSleep() {
-	if (batteryMilliVolts > 3300) {
+	if (batteryMilliVolts > 3300 & recording == true) {
 		time_t currentEpoch;
 		time(&currentEpoch);
-		uint16_t secondsToNextRecording = currentRecordingEpoch - currentEpoch;
+
+		// Calculate the seconds to the next recording, considering possible overflow
+		uint16_t secondsToNextRecording;
+		if (currentRecordingEpoch > currentEpoch) {
+			secondsToNextRecording = static_cast<uint16_t>(currentRecordingEpoch - currentEpoch);
+		} else {
+			secondsToNextRecording = 1;
+		}
+
+		// Enable timer wakeup with the calculated seconds
 		esp_sleep_enable_timer_wakeup(secondsToNextRecording * 1000000ULL);
 		ESP_LOGI("Going to sleep for", "%is", secondsToNextRecording);
 	} else {
-		ESP_LOGW("Battery", "Low Voltage, entering long sleep");
+		ESP_LOGI("", "entering long sleep");
 	}
 
+	// Enable external wakeup using the defined interrupt bitmask
 	esp_sleep_enable_ext1_wakeup(DEEPSLEEP_INTERUPT_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
 	ESP_LOGI("DeepSleep", "Going to sleep now");
+
+	// Start deep sleep
 	esp_deep_sleep_start();
 }
 
@@ -259,26 +312,30 @@ void initScreen() {
 }
 
 void updateScreen() {
-	screen.setTextColor(TFT_WHITE, TFT_BLACK, true);  // fills background to wipe previous text
-
 	// Draw REC symbol
-	if (recordingDot == true) {
-		screen.fillSmoothCircle(8 + 10, 8 + 10, 10, TFT_RED);
-		screen.drawString("REC", 34, 8, 4);
-	} else {
-		screen.fillSmoothCircle(8 + 10, 8 + 10, 10, TFT_BLACK);
+	if (recording == true){
+		if (recordingDot == true) {
+			screen.fillSmoothCircle(8 + 10, 8 + 10, 10, TFT_RED, TFT_BLACK);
+
+			screen.setTextColor(TFT_WHITE, TFT_BLACK, true);
+			screen.drawString("REC", 34, 8, 4);
+		} else {
+			screen.fillCircle(8 + 10, 8 + 10, 12, TFT_BLACK);
+		}
+		recordingDot = !recordingDot;
 	}
-	recordingDot = !recordingDot;
+
+	screen.setTextColor(TFT_WHITE, TFT_BLACK, true);  // fills background to wipe previous text
 
 	// Draw Battery Percentage
 	screen.drawString(calculateBatteryPercentage(batteryMilliVolts), 112, 8, 4);
 
-	// Draw Temerature Values
+	// Draw Temperature Values
 	uint8_t yPosition = 36;
 
 	for (uint8_t i = 0; i < ONEWIRE_PORT_COUNT; i++) {
 		if (oneWirePort[i].numberOfSensors > 0) {
-			screen.drawWideLine(6, yPosition, 6, yPosition + (oneWirePort[i].numberOfSensors - 1) * 26 + 20, 5, oneWirePort[i].color);	// draw color bar to indicate bus
+			screen.drawWideLine(6, yPosition, 6, yPosition + (oneWirePort[i].numberOfSensors - 1) * 26 + 20, 5, oneWirePort[i].color, TFT_BLACK);  // draw color bar to indicate bus
 
 			for (uint8_t j = 0; j < oneWirePort[i].numberOfSensors; j++) {
 				screen.drawString(deviceAddressto4Char(oneWirePort[i].sensorList[j].address), 12, yPosition, 4);
@@ -286,8 +343,6 @@ void updateScreen() {
 				screen.drawFloat(oneWirePort[i].sensorList[j].temperature, 1, 12 + (4 * 20), yPosition, 4);
 				screen.drawString("`c", 12 + (4 * 20) + 50, yPosition, 4);
 
-				// screen.setCursor(12 + (4 * 20), yPosition, 4);
-				// screen.printf("%2.1f`C", oneWirePort[i].sensorList[j].temperature);
 				yPosition += 26;
 			}
 
@@ -422,7 +477,6 @@ void readBatteryVoltageTask(void* parameter) {
 	analogSetPinAttenuation(VBAT_SENSE, ADC_0db);  // 0db (0 mV ~ 750 mV)
 	vTaskDelay(300 / portTICK_PERIOD_MS);
 	batteryMilliVolts = analogReadMilliVolts(VBAT_SENSE) * VBAT_SENSE_SCALE;
-	ESP_LOGD("Battery Voltage", "%imV", batteryMilliVolts);
 	vTaskDelete(NULL);
 }
 
@@ -452,9 +506,16 @@ void setup() {
 			ESP_LOGI("Woken by", "Button");
 			displayOn = true;
 
+			pinMode(WAKE_BUTTON, INPUT);
+			attachInterrupt(digitalPinToInterrupt(WAKE_BUTTON), buttonInterrupt, RISING);
+
+			buttonSemaphore = xSemaphoreCreateBinary();
+
+			xTaskCreate(buttonTask, "Button Task", 2048, NULL, 1, NULL);
+
 			xTaskCreate(SPIManagerTask, "SPIManagerTask", 5000, NULL, 1, NULL);
-			xTaskCreate(readBatteryVoltageTask, "readBatteryVoltageTask", 5000, NULL, 1, NULL);
 			xTaskCreate(clockManagerTask, "clockManagerTask", 5000, NULL, 1, NULL);
+			xTaskCreate(readBatteryVoltageTask, "readBatteryVoltageTask", 5000, NULL, 1, NULL);
 			xTaskCreate(readOneWireTemperaturesTask, "readOneWireTemperaturesTask", 10000, NULL, 1, NULL);
 
 			break;

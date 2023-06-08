@@ -37,6 +37,7 @@
 *.clang_complete
 *.gcc-flags.json
 *.pio
+*credentials.h
 
 .vscode/*
 !.vscode/settings.json
