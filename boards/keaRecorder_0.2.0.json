@@ -5,6 +5,7 @@
         },
         "core": "esp32",
         "extra_flags": [
+            "-DARDUINO_USB_CDC_ON_BOOT",
             "-DUSER_SETUP_LOADED=1",
             "-DST7789_DRIVER=1",
             "-DTFT_WIDTH=172",

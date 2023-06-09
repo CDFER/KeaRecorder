@@ -1,18 +1,23 @@
 #include <Arduino.h>
 
 #include "USB.h"
+#if ARDUINO_USB_CDC_ON_BOOT
+#define HWSerial Serial0
+#define USBSerial Serial
+#else
 #define HWSerial Serial
-// USBCDC USBSerial;
+USBCDC USBSerial;
+#endif
 
 #include <SD.h>
 #include <tft_eSPI.h>
 TFT_eSPI screen = TFT_eSPI();
 
-#define SCREEN_ON_TIME 120
+#define SCREEN_ON_TIME 10
 
 #include <WiFi.h>
-#include "credentials.h"
 
+#include "credentials.h"
 #ifndef CREDENTIALS_H
 #define CREDENTIALS_H
 
@@ -31,16 +36,16 @@ const char* time_format = "%d/%m/%y,%H:%M:%S";
 #include <DallasTemperature.h>
 #include <OneWire.h>
 
-#define DEEPSLEEP_INTERUPT_BITMASK pow(2, WAKE_BUTTON) + pow(2, UP_BUTTON) + pow(2, DOWN_BUTTON)
-#define HOLD_DURATION 3000  // Hold duration in milliseconds to start and end recording
+#define DEEPSLEEP_INTERUPT_BITMASK pow(2, WAKE_BUTTON) + pow(2, VUSB_SENSE)
+#define RTC_DEEPSLEEP_INTERUPT_BITMASK DEEPSLEEP_INTERUPT_BITMASK + pow(2, WIRE_RTC_INT)
 
-RTC_DATA_ATTR uint16_t bootCount = 0;
-RTC_DATA_ATTR uint16_t batteryMilliVolts = 0;
+#define HOLD_DURATION 3000	// Hold duration in milliseconds to start and end recording
+
+RTC_DATA_ATTR uint32_t batteryMilliVolts = 0;
 RTC_DATA_ATTR bool recording = false;
-RTC_DATA_ATTR uint16_t recordingIntervalSeconds = 900;
-RTC_DATA_ATTR time_t currentRecordingEpoch;
+RTC_DATA_ATTR uint8_t recordingIntervalMins = 2;
 
-#define ONEWIRE_TEMP_RESOLUTION 12
+#define ONEWIRE_TEMP_RESOLUTION 9
 #define ONEWIRE_PORT_COUNT 3
 
 struct temperatureSensor {
@@ -58,9 +63,6 @@ struct temperatureSensorBus {
 	uint32_t color;
 };
 
-/**
- * @brief Structure to hold SD card information.
- */
 struct sdCard {
 	uint8_t cardTotalGib;	/** Card size in GiB. */
 	uint8_t cardUsedGib;	/** Card space used in GiB. */
@@ -68,20 +70,12 @@ struct sdCard {
 	bool connected = false; /** Flag indicating if an SD card is connected. */
 };
 
-struct logFile {
-	uint16_t sizeMib;
-	uint16_t datapoints;
-	char* filename;
-};
-
 RTC_DATA_ATTR temperatureSensorBus oneWirePort[ONEWIRE_PORT_COUNT];
 RTC_DATA_ATTR sdCard microSDCard;
 
 bool systemTimeValid = false;
-char currentRecordingEpochtimeStamp[32];
 
 bool recordingDot = true;
-bool displayOn;
 
 SemaphoreHandle_t buttonSemaphore;
 
@@ -91,13 +85,45 @@ void buttonInterrupt() {
 	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
-void buttonTask(void* pvParameters) {
+void setupNextAlarm() {
+	// Read the current time from the RTC
+	RTC_Date currentTime = rtc.getDateTime();
+
+	// Calculate the nearest alarm time based on the interval
+	uint8_t alarmMinute = currentTime.minute / recordingIntervalMins * recordingIntervalMins;
+	if (currentTime.minute % recordingIntervalMins != 0) {
+		alarmMinute += recordingIntervalMins;
+	}
+
+	// Check if the calculated alarm minute is in the past, increase into the future if needed
+	if (alarmMinute <= currentTime.minute) {
+		alarmMinute += recordingIntervalMins;
+		if (alarmMinute >= 60) {
+			alarmMinute = 0;
+		}
+	}
+
+	// Set the alarm
+	rtc.setAlarmByMinutes(alarmMinute);
+	rtc.enableAlarm();
+	rtc.disableTimer();
+	rtc.clearTimer();
+
+	ESP_LOGI("Setting Recording Alarm to ", "%i, currently %i", alarmMinute, currentTime.minute);
+}
+
+void buttonTask(void* parameter) {
+	pinMode(WAKE_BUTTON, INPUT);
+	attachInterrupt(digitalPinToInterrupt(WAKE_BUTTON), buttonInterrupt, RISING);
+
+	buttonSemaphore = xSemaphoreCreateBinary();
+
 	TickType_t lastWakeTime = xTaskGetTickCount();
 
 	while (1) {
 		if (xSemaphoreTake(buttonSemaphore, portMAX_DELAY) == pdTRUE) {
 			if (digitalRead(WAKE_BUTTON) == HIGH) {
-				vTaskDelay(HOLD_DURATION/ portTICK_PERIOD_MS);
+				vTaskDelay(HOLD_DURATION / portTICK_PERIOD_MS);
 
 				if (digitalRead(WAKE_BUTTON) == HIGH) {
 					if (recording == true) {
@@ -105,7 +131,7 @@ void buttonTask(void* pvParameters) {
 
 					} else {
 						recording = true;
-
+						setupNextAlarm();
 					}
 				}
 			}
@@ -115,24 +141,35 @@ void buttonTask(void* pvParameters) {
 	}
 }
 
-void clockManagerTask(void* parameter) {
+void enterDeepSleep() {
+	if (batteryMilliVolts > 3300 & recording == true) {
+		esp_sleep_enable_ext1_wakeup(RTC_DEEPSLEEP_INTERUPT_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
+		ESP_LOGV("Enter DeepSleep", "Waiting For RTC or user input");
+	} else {
+		esp_sleep_enable_ext1_wakeup(DEEPSLEEP_INTERUPT_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
+		ESP_LOGI("Enter DeepSleep", "Waiting for user input");
+	}
+	esp_deep_sleep_start();
+}
+
+void updateClock() {
 	Wire.begin(WIRE_SDA, WIRE_SCL, 100000);
 	rtc.begin(Wire);
 
 	if (rtc.syncToSystem() == true) {
 		setenv("TZ", time_zone, 1);
 		tzset();
-
 		systemTimeValid = true;
 	} else {
 		ESP_LOGE("Time", "NOT VALID");
 	}
 
 	if (recording == true) {
-		struct tm timeInfo;
-		localtime_r(&currentRecordingEpoch, &timeInfo);
-		strftime(currentRecordingEpochtimeStamp, 32, time_format, &timeInfo);
-		ESP_LOGI("Time", "%s", currentRecordingEpochtimeStamp);
+		pinMode(WIRE_RTC_INT, INPUT);
+
+		if (digitalRead(WIRE_RTC_INT) == HIGH) {
+			setupNextAlarm();
+		}
 
 	} else if (systemTimeValid == false) {
 		// Define the NTP servers to be used for time synchronization
@@ -156,8 +193,6 @@ void clockManagerTask(void* parameter) {
 		rtc.syncToRtc();
 		WiFi.disconnect();
 	}
-
-	vTaskDelete(NULL);
 }
 
 // Function to extract the first hex character from byte 1, 3, 5, and 7 of a DeviceAddress
@@ -214,45 +249,13 @@ const char* calculateBatteryPercentage(uint16_t batteryMilliVolts) {
 	return batteryPercentage;
 }
 
-/**
- * @brief Enters deep sleep mode based on the battery voltage and current epoch time.
- *
- */
-void enterDeepSleep() {
-	if (batteryMilliVolts > 3300 & recording == true) {
-		time_t currentEpoch;
-		time(&currentEpoch);
-
-		// Calculate the seconds to the next recording, considering possible overflow
-		uint16_t secondsToNextRecording;
-		if (currentRecordingEpoch > currentEpoch) {
-			secondsToNextRecording = static_cast<uint16_t>(currentRecordingEpoch - currentEpoch);
-		} else {
-			secondsToNextRecording = 1;
-		}
-
-		// Enable timer wakeup with the calculated seconds
-		esp_sleep_enable_timer_wakeup(secondsToNextRecording * 1000000ULL);
-		ESP_LOGI("Going to sleep for", "%is", secondsToNextRecording);
-	} else {
-		ESP_LOGI("", "entering long sleep");
-	}
-
-	// Enable external wakeup using the defined interrupt bitmask
-	esp_sleep_enable_ext1_wakeup(DEEPSLEEP_INTERUPT_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
-	ESP_LOGI("DeepSleep", "Going to sleep now");
-
-	// Start deep sleep
-	esp_deep_sleep_start();
-}
-
 const char* sdCardType(struct sdCard& cardInfo) {
 	const char* cardTypeString = "";
 
 	if (cardInfo.cardType == CARD_NONE) {
-		Serial.println("No SD card attached");
+		// Serial.println("No SD card attached");
 	} else {
-		Serial.print("SD Card Type: ");
+		// Serial.print("SD Card Type: ");
 		if (cardInfo.cardType == CARD_MMC) {
 			cardTypeString = "MMC";
 		} else if (cardInfo.cardType == CARD_SD) {
@@ -262,7 +265,7 @@ const char* sdCardType(struct sdCard& cardInfo) {
 		} else {
 			cardTypeString = "UNKNOWN";
 		}
-		Serial.println(cardTypeString);
+		// Serial.println(cardTypeString);
 	}
 	return cardTypeString;
 }
@@ -292,14 +295,63 @@ void populateSDCardInfo(struct sdCard& cardInfo) {
 }
 
 void writeLineToSDcard() {
+	pinMode(SPI_EN, OUTPUT);
+	digitalWrite(SPI_EN, HIGH);
+
+	struct tm timeInfo;
+	time_t currentEpoch;
+	time(&currentEpoch);
+	char currentTimeStamp[32];
+	localtime_r(&currentEpoch, &timeInfo);
+	strftime(currentTimeStamp, 32, time_format, &timeInfo);
+
+	char buf[128];
+	sprintf(buf, "%s,%i", currentTimeStamp, batteryMilliVolts);
+
+	SD.begin(SD_CARD_CS);
 	File file;
-	char buf[64];
+	file = SD.open("/timeTest.csv", FILE_APPEND, true);
 
-	sprintf(buf, "%s,%i,%.2f,%.2f,%.2f", currentRecordingEpochtimeStamp, batteryMilliVolts, oneWirePort[1].sensorList[0].temperature, oneWirePort[1].sensorList[1].temperature, oneWirePort[1].sensorList[2].temperature);
+	// Check if the file is empty
+	if (file.size() == 0) {
+		char headerBuf[128] = "currentTimeStamp, batteryMilliVolts";
+		// Iterate over each temperature sensor bus
+		for (uint8_t i = 0; i < ONEWIRE_PORT_COUNT; i++) {
+			if (oneWirePort[i].numberOfSensors > 0) {
+				// Iterate over each sensor on the current bus
+				for (uint8_t j = 0; j < oneWirePort[i].numberOfSensors; j++) {
+					// Convert the address to a string
+					strcat(headerBuf, deviceAddressto4Char(oneWirePort[i].sensorList[j].address));
+				}
+			}
+		}
 
-	file = SD.open("/data.csv", FILE_APPEND, true);
+		file.println(headerBuf);
+	}
+
+	// Iterate over each temperature sensor bus
+	for (uint8_t i = 0; i < ONEWIRE_PORT_COUNT; i++) {
+		if (oneWirePort[i].numberOfSensors > 0) {
+			// Iterate over each sensor on the current bus
+			for (uint8_t j = 0; j < oneWirePort[i].numberOfSensors; j++) {
+				// Read the temperature for the current sensor
+				float temperature = oneWirePort[i].dallasTemperatureBus.getTempC(oneWirePort[i].sensorList[j].address);
+
+				// Update the temperature value in the sensor list
+				oneWirePort[i].sensorList[j].temperature = temperature;
+
+				// Append the temperature value to the string
+				char tempStr[10];
+				sprintf(tempStr, ",%.2f", temperature);
+				strcat(buf, tempStr);
+			}
+		}
+	}
+
 	file.println(buf);
 	file.close();
+
+	ESP_LOGD("", "%s", buf);
 }
 
 void initScreen() {
@@ -313,7 +365,7 @@ void initScreen() {
 
 void updateScreen() {
 	// Draw REC symbol
-	if (recording == true){
+	if (recording == true) {
 		if (recordingDot == true) {
 			screen.fillSmoothCircle(8 + 10, 8 + 10, 10, TFT_RED, TFT_BLACK);
 
@@ -363,7 +415,7 @@ void updateScreen() {
 	char dateTime[32];
 	time_t currentEpoch;
 	time(&currentEpoch);
-	localtime_r(&currentRecordingEpoch, &timeInfo);
+	localtime_r(&currentEpoch, &timeInfo);
 	strftime(dateTime, 32, "%d/%b/%Y %H:%M", &timeInfo);
 
 	screen.drawString(dateTime, 8, 300, 2);
@@ -379,29 +431,18 @@ void SPIManagerTask(void* parameter) {
 	digitalWrite(SD_CARD_CS, LOW);
 
 	if (SD.begin(SD_CARD_CS)) {
-		if (displayOn == true) {
-			populateSDCardInfo(microSDCard);
-		} else {
-			vTaskSuspend(NULL);	 // Wait for new info
-			writeLineToSDcard();
-			enterDeepSleep();
-		}
-
+		populateSDCardInfo(microSDCard);
 	} else {
 		ESP_LOGW("SD Card", "Mount Failed!");
 		microSDCard.connected = false;
 	}
 
-	digitalWrite(SD_CARD_CS, LOW);
-	digitalWrite(TFT_CS, HIGH);
 	initScreen();
 
-	while (millis() <= SCREEN_ON_TIME * 1000) {
+	while (true) {
 		updateScreen();
 		vTaskDelay(500 / portTICK_PERIOD_MS);
 	}
-
-	enterDeepSleep();
 
 	vTaskDelete(NULL);
 }
@@ -438,85 +479,77 @@ void scanOneWireBusses() {
 	}
 }
 
-void readOneWireTemperaturesTask(void* parameter) {
-	pinMode(OUTPUT_EN, OUTPUT);
-	digitalWrite(OUTPUT_EN, HIGH);
-
-	do {
-		if (recording == false) {
-			scanOneWireBusses();
+void readOneWireTemperatures() {
+	for (uint8_t i = 0; i < ONEWIRE_PORT_COUNT; i++) {
+		if (oneWirePort[i].numberOfSensors > 0) {
+			oneWirePort[i].oneWireBus.begin(oneWirePort[i].oneWirePin);
+			oneWirePort[i].dallasTemperatureBus.setOneWire(&oneWirePort[i].oneWireBus);	 // Sets up pointer to oneWire Instance
+			oneWirePort[i].dallasTemperatureBus.setWaitForConversion(false);
+			oneWirePort[i].dallasTemperatureBus.requestTemperatures();
+			// ESP_LOGD("requested Temperatures on", "bus: %i", i);
 		}
+	}
 
-		for (uint8_t i = 0; i < ONEWIRE_PORT_COUNT; i++) {
-			if (oneWirePort[i].numberOfSensors > 0) {
-				oneWirePort[i].oneWireBus.begin(oneWirePort[i].oneWirePin);
-				oneWirePort[i].dallasTemperatureBus.setOneWire(&oneWirePort[i].oneWireBus);	 // Sets up pointer to oneWire Instance
-				oneWirePort[i].dallasTemperatureBus.setWaitForConversion(false);
-				oneWirePort[i].dallasTemperatureBus.requestTemperatures();
-				// ESP_LOGD("requested Temperatures on", "bus: %i", i);
+	vTaskDelay(oneWirePort[0].dallasTemperatureBus.millisToWaitForConversion(ONEWIRE_TEMP_RESOLUTION) / portTICK_PERIOD_MS);
+
+	for (uint8_t i = 0; i < ONEWIRE_PORT_COUNT; i++) {
+		if (oneWirePort[i].numberOfSensors > 0) {
+			for (uint8_t j = 0; j < oneWirePort[i].numberOfSensors; j++) {
+				oneWirePort[i].sensorList[j].temperature = oneWirePort[i].dallasTemperatureBus.getTempC(oneWirePort[i].sensorList[j].address);
+				// ESP_LOGD("got", " %.2f for bus %i sensor %i", oneWirePort[i].sensorList[j].temperature, i, j);
 			}
 		}
-
-		vTaskDelay(750 / portTICK_PERIOD_MS);
-
-		for (uint8_t i = 0; i < ONEWIRE_PORT_COUNT; i++) {
-			if (oneWirePort[i].numberOfSensors > 0) {
-				for (uint8_t j = 0; j < oneWirePort[i].numberOfSensors; j++) {
-					oneWirePort[i].sensorList[j].temperature = oneWirePort[i].dallasTemperatureBus.getTempC(oneWirePort[i].sensorList[j].address);
-					// ESP_LOGD("got", " %.2f for bus %i sensor %i", oneWirePort[i].sensorList[j].temperature, i, j);
-				}
-			}
-		}
-	} while (displayOn == true);
-
-	digitalWrite(OUTPUT_EN, LOW);
-	vTaskDelete(NULL);
+	}
 }
 
-void readBatteryVoltageTask(void* parameter) {
-	analogSetPinAttenuation(VBAT_SENSE, ADC_0db);  // 0db (0 mV ~ 750 mV)
-	vTaskDelay(300 / portTICK_PERIOD_MS);
-	batteryMilliVolts = analogReadMilliVolts(VBAT_SENSE) * VBAT_SENSE_SCALE;
+void readOneWireTemperaturesTask(void* parameter) {
+	while (true) {
+		if (recording == false){
+			scanOneWireBusses();
+		}
+		readOneWireTemperatures();
+	}
 	vTaskDelete(NULL);
 }
 
 void setup() {
-	++bootCount;
-	ESP_LOGI("BootCount", "%i", bootCount);
+	uint64_t wakeupStatus = esp_sleep_get_ext1_wakeup_status();
+	uint8_t wakeupPin = static_cast<uint8_t>(log(wakeupStatus) / log(2));
+	batteryMilliVolts = analogReadMilliVolts(VBAT_SENSE) * VBAT_SENSE_SCALE;
 
-	esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-
-	switch (wakeup_reason) {
-		case ESP_SLEEP_WAKEUP_TIMER:
-			currentRecordingEpoch += recordingIntervalSeconds;
-
-			ESP_LOGI("Woken by", "Timer");
-			displayOn = false;
-
-			xTaskCreate(readOneWireTemperaturesTask, "readOneWireTemperatures", 10000, NULL, 1, NULL);
-			xTaskCreate(SPIManagerTask, "SPIManagerTask", 5000, NULL, 1, NULL);
-			xTaskCreate(readBatteryVoltageTask, "readBatteryVoltageTask", 5000, NULL, 3, NULL);
-			xTaskCreate(clockManagerTask, "clockManagerTask", 5000, NULL, 3, NULL);
-
+	switch (wakeupPin) {
+		case WIRE_RTC_INT:
+			ESP_LOGD("batteryMilliVolts", " %i", batteryMilliVolts);
+			updateClock();
+			readOneWireTemperatures();
+			writeLineToSDcard();
+			enterDeepSleep();
 			break;
 
-		case ESP_SLEEP_WAKEUP_EXT0:
-		case ESP_SLEEP_WAKEUP_EXT1:
+		case VUSB_SENSE:
+			USBSerial.begin();
+			USBSerial.setDebugOutput(true);
+			USB.begin();
+
+		case WAKE_BUTTON:
+		case UP_BUTTON:
+		case DOWN_BUTTON:
 		default:
-			ESP_LOGI("Woken by", "Button");
-			displayOn = true;
 
-			pinMode(WAKE_BUTTON, INPUT);
-			attachInterrupt(digitalPinToInterrupt(WAKE_BUTTON), buttonInterrupt, RISING);
+			ESP_LOGV("UI Mode", "");
 
-			buttonSemaphore = xSemaphoreCreateBinary();
-
-			xTaskCreate(buttonTask, "Button Task", 2048, NULL, 1, NULL);
-
+			xTaskCreate(buttonTask, "Button Task", 2048, NULL, 2, NULL);
 			xTaskCreate(SPIManagerTask, "SPIManagerTask", 5000, NULL, 1, NULL);
-			xTaskCreate(clockManagerTask, "clockManagerTask", 5000, NULL, 1, NULL);
-			xTaskCreate(readBatteryVoltageTask, "readBatteryVoltageTask", 5000, NULL, 1, NULL);
-			xTaskCreate(readOneWireTemperaturesTask, "readOneWireTemperaturesTask", 10000, NULL, 1, NULL);
+			xTaskCreate(readOneWireTemperaturesTask, "readOneWireTemperaturesTask", 10000, NULL, 2, NULL);
+
+			updateClock();
+
+			pinMode(VUSB_SENSE, INPUT);
+
+			while (millis() <= SCREEN_ON_TIME * 1000 || digitalRead(VUSB_SENSE) == HIGH) {
+				vTaskDelay(500 / portTICK_PERIOD_MS);
+			}
+			enterDeepSleep();
 
 			break;
 	}
