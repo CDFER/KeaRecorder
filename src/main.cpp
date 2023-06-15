@@ -25,12 +25,15 @@ constexpr uint8_t SCREEN_ON_TIME = 10;
 constexpr uint16_t HOLD_DURATION = 3000;
 constexpr uint8_t ONEWIRE_TEMP_RESOLUTION = 10;
 
+const uint8_t batterySmoothingFactor = 10;	   // Example: 10 represents 10% of new value
+const float temperatureSmoothingFactor = 0.5;  // Smaller values for slower response, larger values for faster response with more noise
+
 const char* time_zone = "NZST-12NZDT,M9.5.0,M4.1.0/3";
 constexpr uint32_t DEEPSLEEP_INTERUPT_BITMASK = (1UL << WAKE_BUTTON) | (1UL << VUSB_SENSE);
 constexpr uint32_t RTC_DEEPSLEEP_INTERUPT_BITMASK = DEEPSLEEP_INTERUPT_BITMASK | (1UL << WIRE_RTC_INT);
 
 // Ultra Global Variables (stored even in deep sleep)
-RTC_DATA_ATTR uint32_t batteryMilliVolts = 0;
+RTC_DATA_ATTR uint16_t batteryMilliVolts = 0;
 RTC_DATA_ATTR bool recording = false;
 RTC_DATA_ATTR uint8_t recordingIntervalMins = 2;
 RTC_DATA_ATTR char logFilePath[64];
@@ -51,7 +54,7 @@ auto configurePin = [](int pin, int mode, int initialState) {
 	digitalWrite(pin, initialState);
 };
 
-// For this to work with Espressif's ESP32 code you need to change line 694 esp32 / hardware / eps32 / 2.0.3 / libraries / SD / src / sd_diskio.cpp :
+// For this to work with Espressif's ESP32 code you need to change line 694 esp32 / hardware / eps32 / 2.0.3 / libraries / SD / src / sd_diskio.cpp
 
 static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
 	return SD.writeRAW((uint8_t*)buffer, lba) ? bufsize : -1;
@@ -405,11 +408,8 @@ void populateSDCardInfo(sdCard& cardInfo) {
 				break;
 		}
 
-		uint64_t cardSize = SD.totalBytes() / (1024 * 1024);
-		cardInfo.cardTotalMib = static_cast<uint16_t>(cardSize);
-
-		uint64_t usedSize = SD.usedBytes() / (1024 * 1024);
-		cardInfo.cardUsedMib = static_cast<uint16_t>(usedSize);
+		cardInfo.cardTotalMib = static_cast<uint16_t>(SD.totalBytes() / (1024 * 1024));
+		cardInfo.cardUsedMib = static_cast<uint16_t>(SD.usedBytes() / (1024 * 1024));
 
 		// Log the SD card information
 		ESP_LOGI("SD Card Info", "Type: %s, Total Size: %u MiB, Used Size: %u MiB",
@@ -447,8 +447,8 @@ void populateSDCardInfo(sdCard& cardInfo) {
 void writeLineToSDcard() {
 	// Configure pins
 	configurePin(SPI_EN, OUTPUT, HIGH);
-	pinMode(TFT_CS, OUTPUT);
-	pinMode(SD_CARD_CS, OUTPUT);
+	configurePin(TFT_CS, OUTPUT, HIGH);
+	configurePin(SD_CARD_CS, OUTPUT, HIGH);
 
 	// Initialize SD card
 	if (SD.begin(SD_CARD_CS)) {
@@ -503,7 +503,7 @@ void writeLineToSDcard() {
 					} else {
 						// Get the temperature reading from ram
 						float temperature = bus.sensorList[sensorIndex].temperature;
-						snprintf(tempStr, sizeof(tempStr), ",%.2f", temperature);
+						snprintf(tempStr, sizeof(tempStr), ",%.1f", temperature);
 					}
 
 					// Append the temperature reading to the data line
@@ -636,8 +636,8 @@ void updateScreen() {
 void SPIManagerTask(void* parameter) {
 	// Configure pins
 	configurePin(SPI_EN, OUTPUT, HIGH);
-	pinMode(TFT_CS, OUTPUT);
-	pinMode(SD_CARD_CS, OUTPUT);
+	configurePin(TFT_CS, OUTPUT, HIGH);
+	configurePin(SD_CARD_CS, OUTPUT, HIGH);
 
 	// Initialize screen
 	screen.init();
@@ -752,13 +752,21 @@ void readOneWireTemperatures() {
 
 		if (bus.numberOfSensors > 0) {
 			for (uint8_t sensorIndex = 0; sensorIndex < bus.numberOfSensors; ++sensorIndex) {
-				float temperature = bus.dallasTemperatureBus.getTempC(bus.sensorList[sensorIndex].address);
+				// Read the temperature
+				float currentTemperature = bus.dallasTemperatureBus.getTempC(bus.sensorList[sensorIndex].address);
 
-				if (temperature == DEVICE_DISCONNECTED_C) {
+				// Check if the temperature is disconnected
+				if (currentTemperature == DEVICE_DISCONNECTED_C) {
 					bus.sensorList[sensorIndex].error = true;
 				} else {
+					// Apply exponential smoothing
+					if (bus.sensorList[sensorIndex].error) {
+						bus.sensorList[sensorIndex].temperature = currentTemperature;
+					} else {
+						bus.sensorList[sensorIndex].temperature = (temperatureSmoothingFactor * currentTemperature) + ((1 - temperatureSmoothingFactor) * bus.sensorList[sensorIndex].temperature);
+					}
+
 					bus.sensorList[sensorIndex].error = false;
-					bus.sensorList[sensorIndex].temperature = temperature;
 				}
 			}
 		}
@@ -782,6 +790,22 @@ void readOneWireTemperaturesTask(void* parameter) {
 	vTaskDelete(NULL);
 }
 
+void readBatteryVoltage() {
+	// Read the current battery millivolts
+	uint16_t currentMilliVolts = static_cast<uint16_t>(analogReadMilliVolts(VBAT_SENSE) * VBAT_SENSE_SCALE);
+
+	// Exponential smoothing calculation
+	if (batteryMilliVolts == 0) {
+		batteryMilliVolts = currentMilliVolts;
+	} else {
+		batteryMilliVolts = (batterySmoothingFactor * currentMilliVolts + (100 - batterySmoothingFactor) * batteryMilliVolts) / 100;
+	}
+
+	ESP_LOGD("Battery", "%umV", batteryMilliVolts);
+
+	return;
+}
+
 void setup() {
 	Serial.begin(115200);
 
@@ -789,9 +813,7 @@ void setup() {
 	uint64_t wakeupStatus = esp_sleep_get_ext1_wakeup_status();
 	uint8_t wakeupPin = static_cast<uint8_t>(log2(wakeupStatus));
 
-	// Read battery voltage
-	batteryMilliVolts = analogReadMilliVolts(VBAT_SENSE) * VBAT_SENSE_SCALE;
-	ESP_LOGD("Battery", "%umV", batteryMilliVolts);
+	readBatteryVoltage();
 
 	switch (wakeupPin) {
 		case WIRE_RTC_INT:

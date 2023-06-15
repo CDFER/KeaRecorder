@@ -8,5 +8,10 @@
         "streambuf": "cpp",
         "functional": "cpp",
         "typeinfo": "cpp"
-    }
+    },
+    "cSpell.words": [
+        "ONEWIRE",
+        "SSID",
+        "USBMSC"
+    ]
 }
