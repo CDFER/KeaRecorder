@@ -1,7 +1,17 @@
 {
     "files.associations": {
         "*.html": "html",
-        "*.tcc": "cpp",
-        "fstream": "cpp"
-    }
+        "cmath": "cpp",
+        "atomic": "cpp",
+        "optional": "cpp",
+        "new": "cpp",
+        "streambuf": "cpp",
+        "functional": "cpp",
+        "typeinfo": "cpp"
+    },
+    "cSpell.words": [
+        "ONEWIRE",
+        "SSID",
+        "USBMSC"
+    ]
 }
