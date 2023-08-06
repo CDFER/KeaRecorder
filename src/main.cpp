@@ -285,7 +285,7 @@ void buttonTask(void* parameter) {
 						vTaskDelay(10000 / portTICK_PERIOD_MS);
 					}
 				}
-			} 
+			}
 		}
 
 		vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(10));	// Check every 10 milliseconds for interrupt semaphore
